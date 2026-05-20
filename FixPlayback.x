@@ -184,24 +184,17 @@ static void forceRenderViewType(YTHotConfig *hotConfig) {
 // ---------------------------------------------------------------------------
 // Client type spoofing: IOS → TVHTML5
 //
-// YouTube's Google Video Server requires a Proof-of-Origin (PO) Token for
-// DASH streams served to the IOS client. Sideloaded apps can't generate
-// a valid token (needs DeviceCheck/AppAttest). TVHTML5 clients receive an
-// HLS manifest URL (hlsManifestUrl) in the streamingData instead of DASH
-// segments, and HLS currently does NOT require a PO Token.
+// YouTube's GVS requires a PO Token for DASH from the IOS client. Sideloaded
+// apps can't generate valid tokens (needs DeviceCheck/AppAttest). TVHTML5
+// clients receive hlsManifestUrl in streamingData instead of DASH segments;
+// HLS does not require a PO Token.
 //
-// We intercept the /youtubei/v1/player POST request body, change clientName
-// from "IOS" to "TVHTML5" and bump clientVersion to match. The server then
-// returns hlsManifestUrl, which populates the mlhls:// chain used by
-// MLAVAssetDownloader → AVPlayer, allowing playback without a PO Token.
+// Implementation: NSURLProtocol subclass injected into every NSURLSession's
+// protocolClasses list. This catches requests regardless of session
+// configuration or subclassing — the previous approach (hooking instance
+// methods on NSURLSession) missed YouTube's custom-configured sessions.
 // ---------------------------------------------------------------------------
 
-static BOOL isPlayerEndpoint(NSURL *url) {
-    return [url.path containsString:@"/youtubei/v1/player"];
-}
-
-// Parse bodyData as JSON, swap IOS → TVHTML5, return modified bytes.
-// Returns the original bodyData unchanged on any parse/serialisation error.
 static NSData *spoofClientInBody(NSData *bodyData) {
     if (!bodyData || bodyData.length == 0) return bodyData;
     NSError *err = nil;
@@ -209,18 +202,13 @@ static NSData *spoofClientInBody(NSData *bodyData) {
                                                options:NSJSONReadingMutableContainers
                                                  error:&err];
     if (err || ![parsed isKindOfClass:[NSMutableDictionary class]]) return bodyData;
-    NSMutableDictionary *body = (NSMutableDictionary *)parsed;
-    id ctxObj = body[@"context"];
-    if (![ctxObj isKindOfClass:[NSMutableDictionary class]]) return bodyData;
-    NSMutableDictionary *context = (NSMutableDictionary *)ctxObj;
-    id clientObj = context[@"client"];
-    if (![clientObj isKindOfClass:[NSMutableDictionary class]]) return bodyData;
-    NSMutableDictionary *client = (NSMutableDictionary *)clientObj;
-    // Only spoof when the original client is IOS; leave anything else alone.
-    if (![client[@"clientName"] isEqualToString:@"IOS"]) return bodyData;
-    client[@"clientName"] = @"TVHTML5";
+    NSMutableDictionary *body   = (NSMutableDictionary *)parsed;
+    NSMutableDictionary *ctx    = body[@"context"];
+    NSMutableDictionary *client = ctx[@"client"];
+    if (![client isKindOfClass:[NSMutableDictionary class]]) return bodyData;
+    if (![client[@"clientName"] isEqualToString:@"IOS"])     return bodyData;
+    client[@"clientName"]    = @"TVHTML5";
     client[@"clientVersion"] = @"7.20240918.01.00";
-    // Strip iOS-specific context fields that don't belong in a TVHTML5 request.
     [client removeObjectForKey:@"deviceMake"];
     [client removeObjectForKey:@"deviceModel"];
     [client removeObjectForKey:@"osName"];
@@ -230,54 +218,133 @@ static NSData *spoofClientInBody(NSData *bodyData) {
     return err ? bodyData : result;
 }
 
-// Return a modified copy of request with TVHTML5 body + headers,
-// or the original request if it isn't a player endpoint.
-static NSURLRequest *spoofedPlayerRequest(NSURLRequest *request) {
-    if (!isPlayerEndpoint(request.URL)) return request;
-    NSMutableURLRequest *mutable = [request mutableCopy];
-    // Always update the client-identifying headers.
-    [mutable setValue:@"7" forHTTPHeaderField:@"X-Youtube-Client-Name"];
-    [mutable setValue:@"7.20240918.01.00" forHTTPHeaderField:@"X-Youtube-Client-Version"];
-    // Modify the JSON body when it was provided inline (most InnerTube calls).
-    NSData *origBody = request.HTTPBody;
-    NSData *newBody = spoofClientInBody(origBody);
-    if (newBody && newBody != origBody) {
-        [mutable setHTTPBody:newBody];
-        [mutable setValue:[NSString stringWithFormat:@"%lu", (unsigned long)newBody.length]
-       forHTTPHeaderField:@"Content-Length"];
+// Reads the HTTP body from either HTTPBody (NSData) or HTTPBodyStream.
+// Consuming the stream is fine here because we always replace it with NSData
+// on the mutable copy we forward.
+static NSData *readHTTPBody(NSURLRequest *req) {
+    if (req.HTTPBody) return req.HTTPBody;
+    NSInputStream *s = req.HTTPBodyStream;
+    if (!s) return nil;
+    [s open];
+    NSMutableData *buf = [NSMutableData dataWithCapacity:8192];
+    uint8_t tmp[4096]; NSInteger n;
+    while ([s hasBytesAvailable] && (n = [s read:tmp maxLength:sizeof(tmp)]) > 0)
+        [buf appendBytes:tmp length:n];
+    [s close];
+    return buf.length ? buf : nil;
+}
+
+static NSString *const kSpoofed = @"YTSpoofed";
+
+// ---- NSURLProtocol subclass ------------------------------------------------
+
+@interface YTClientSpoofProtocol : NSURLProtocol <NSURLSessionDataDelegate>
+@property (nonatomic, strong) NSURLSession *fwdSession;
+@property (nonatomic, strong) NSURLSessionDataTask *fwdTask;
+@end
+
+@implementation YTClientSpoofProtocol
+
++ (BOOL)canInitWithRequest:(NSURLRequest *)req {
+    if (![req.URL.path containsString:@"/youtubei/v1/player"]) return NO;
+    if ([NSURLProtocol propertyForKey:kSpoofed inRequest:req])  return NO;
+    return YES;
+}
++ (NSURLRequest *)canonicalRequestForRequest:(NSURLRequest *)req { return req; }
++ (BOOL)requestIsCacheEquivalent:(NSURLRequest *)a toRequest:(NSURLRequest *)b {
+    return [super requestIsCacheEquivalent:a toRequest:b];
+}
+
+- (void)startLoading {
+    NSMutableURLRequest *mod = [self.request mutableCopy];
+    [NSURLProtocol setProperty:@YES forKey:kSpoofed inRequest:mod];
+
+    [mod setValue:@"7"                  forHTTPHeaderField:@"X-Youtube-Client-Name"];
+    [mod setValue:@"7.20240918.01.00"   forHTTPHeaderField:@"X-Youtube-Client-Version"];
+
+    NSData *newBody = spoofClientInBody(readHTTPBody(self.request));
+    if (newBody) {
+        [mod setHTTPBody:newBody];
+        [mod setValue:[NSString stringWithFormat:@"%lu", (unsigned long)newBody.length]
+   forHTTPHeaderField:@"Content-Length"];
     }
-    return mutable;
+
+    // Use an ephemeral config with an empty protocol list so this forwarded
+    // request is NOT re-intercepted by our own protocol.
+    NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration ephemeralSessionConfiguration];
+    cfg.protocolClasses = @[];
+    self.fwdSession = [NSURLSession sessionWithConfiguration:cfg delegate:self delegateQueue:nil];
+    self.fwdTask    = [self.fwdSession dataTaskWithRequest:mod];
+    [self.fwdTask resume];
+}
+
+- (void)stopLoading {
+    [self.fwdTask cancel];
+    [self.fwdSession invalidateAndCancel];
+    self.fwdTask = self.fwdSession = nil;
+}
+
+- (void)URLSession:(NSURLSession *)s dataTask:(NSURLSessionDataTask *)t
+                             didReceiveResponse:(NSURLResponse *)resp
+                             completionHandler:(void (^)(NSURLSessionResponseDisposition))ch {
+    [self.client URLProtocol:self didReceiveResponse:resp
+          cacheStoragePolicy:NSURLCacheStorageNotAllowed];
+    ch(NSURLSessionResponseAllow);
+}
+- (void)URLSession:(NSURLSession *)s dataTask:(NSURLSessionDataTask *)t
+                                didReceiveData:(NSData *)data {
+    [self.client URLProtocol:self didLoadData:data];
+}
+- (void)URLSession:(NSURLSession *)s task:(NSURLSessionTask *)t
+                        didCompleteWithError:(NSError *)err {
+    if (err) [self.client URLProtocol:self didFailWithError:err];
+    else     [self.client URLProtocolDidFinishLoading:self];
+}
+- (void)URLSession:(NSURLSession *)s task:(NSURLSessionTask *)t
+        willPerformHTTPRedirection:(NSHTTPURLResponse *)resp
+                        newRequest:(NSURLRequest *)req
+                 completionHandler:(void (^)(NSURLRequest *))ch {
+    [self.client URLProtocol:self wasRedirectedToRequest:req redirectResponse:resp];
+    ch(req);
+}
+
+@end
+
+// ---- Inject into every NSURLSession ----------------------------------------
+// Globally-registered protocols are ignored by sessions with custom configs,
+// so we hook the factory class methods to insert our protocol into every
+// session's protocolClasses list at creation time.
+
+static void injectProtocol(NSURLSessionConfiguration *cfg) {
+    if (!cfg) return;
+    NSMutableArray *list = [(cfg.protocolClasses ?: @[]) mutableCopy];
+    if (![list containsObject:[YTClientSpoofProtocol class]]) {
+        [list insertObject:[YTClientSpoofProtocol class] atIndex:0];
+        cfg.protocolClasses = list;
+    }
 }
 
 %hook NSURLSession
 
-// Standard data task (inline body via HTTPBody — used by YouTube's InnerTube).
-- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request
-                            completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))completionHandler {
-    return %orig(spoofedPlayerRequest(request), completionHandler);
++ (NSURLSession *)sessionWithConfiguration:(NSURLSessionConfiguration *)configuration
+                                  delegate:(id)delegate
+                             delegateQueue:(NSOperationQueue *)queue {
+    NSURLSessionConfiguration *cfg = [configuration copy];
+    injectProtocol(cfg);
+    return %orig(cfg, delegate, queue);
 }
 
-- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request {
-    return %orig(spoofedPlayerRequest(request));
-}
-
-// Upload task variant (body passed separately — defensive hook in case YouTube
-// ever sends the player request as an upload task).
-- (NSURLSessionUploadTask *)uploadTaskWithRequest:(NSURLRequest *)request
-                                         fromData:(NSData *)bodyData
-                               completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))completionHandler {
-    if (isPlayerEndpoint(request.URL)) {
-        NSMutableURLRequest *mutable = [request mutableCopy];
-        [mutable setValue:@"7" forHTTPHeaderField:@"X-Youtube-Client-Name"];
-        [mutable setValue:@"7.20240918.01.00" forHTTPHeaderField:@"X-Youtube-Client-Version"];
-        return %orig(mutable, spoofClientInBody(bodyData), completionHandler);
-    }
-    return %orig;
++ (NSURLSession *)sessionWithConfiguration:(NSURLSessionConfiguration *)configuration {
+    NSURLSessionConfiguration *cfg = [configuration copy];
+    injectProtocol(cfg);
+    return %orig(cfg);
 }
 
 %end
 
 %ctor {
     if (!FixPlayback()) return;
+    // Cover the shared session ([NSURLSession sharedSession]) too.
+    [NSURLProtocol registerClass:[YTClientSpoofProtocol class]];
     %init;
 }

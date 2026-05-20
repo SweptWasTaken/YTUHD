@@ -48,10 +48,14 @@ static void forceRenderViewType(YTHotConfig *hotConfig) {
     return makeAVPlayer(self, video, playerConfig, stickySettings);
 }
 
-// Updated: only mediaPlayerResources: variant exists in 21.20.4
-- (MLAVPlayerLayerView *)playerViewForVideo:(MLVideo *)video playerConfig:(MLInnerTubePlayerConfig *)playerConfig mediaPlayerResources:(id)mediaPlayerResources {
-    MLDefaultPlayerViewFactory *factory = [self valueForKey:@"_playerViewFactory"];
-    return [factory AVPlayerViewForVideo:video playerConfig:playerConfig];
+// Force renderViewType=2 into the config before the original factory reads it.
+// The old approach used KVC @"_playerViewFactory" which returns nil in 21.20.4
+// (ivar renamed), causing a nil view → "No stream" UI while AVPlayer buffered
+// happily in the background. %orig with renderViewType already set returns the
+// correct MLAVPlayerLayerView without any KVC.
+- (id)playerViewForVideo:(MLVideo *)video playerConfig:(MLInnerTubePlayerConfig *)playerConfig mediaPlayerResources:(id)mediaPlayerResources {
+    forceRenderViewTypeBase([playerConfig hamplayerConfig]);
+    return %orig;
 }
 
 // Only surviving canQueuePlayerPlay signature in 21.20.4
@@ -73,10 +77,10 @@ static void forceRenderViewType(YTHotConfig *hotConfig) {
     return makeAVPlayer(self, video, playerConfig, stickySettings);
 }
 
-// Updated: only mediaPlayerResources: variant exists in 21.20.4
-- (MLAVPlayerLayerView *)playerViewForVideo:(MLVideo *)video playerConfig:(MLInnerTubePlayerConfig *)playerConfig mediaPlayerResources:(id)mediaPlayerResources {
-    MLDefaultPlayerViewFactory *factory = [self valueForKey:@"_playerViewFactory"];
-    return [factory AVPlayerViewForVideo:video playerConfig:playerConfig];
+// Same fix as MLPlayerPoolImpl above — force renderViewType=2 then %orig.
+- (id)playerViewForVideo:(MLVideo *)video playerConfig:(MLInnerTubePlayerConfig *)playerConfig mediaPlayerResources:(id)mediaPlayerResources {
+    forceRenderViewTypeBase([playerConfig hamplayerConfig]);
+    return %orig;
 }
 
 - (BOOL)canUsePlayerView:(id)playerView forVideo:(MLVideo *)video playerConfig:(MLInnerTubePlayerConfig *)playerConfig {

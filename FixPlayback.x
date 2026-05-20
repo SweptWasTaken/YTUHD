@@ -5,6 +5,8 @@
 #import <Foundation/Foundation.h>
 #import <YouTubeHeader/MLAVPlayer.h>
 #import <YouTubeHeader/MLDefaultPlayerViewFactory.h>
+#import <YouTubeHeader/MLHLSMasterPlaylist.h>
+#import <YouTubeHeader/MLHLSStreamSelector.h>
 #import <YouTubeHeader/MLPlayerPool.h>
 #import <YouTubeHeader/MLPlayerPoolImpl.h>
 #import <YouTubeHeader/MLVideoDecoderFactory.h>
@@ -209,6 +211,30 @@ static NSData *spoofClientInBody(NSData *bodyData) {
     %orig;
 }
 
+%end
+
+// ---------------------------------------------------------------------------
+// HLS stream availability fix
+//
+// When the TVHTML5 spoof is active the player response has hlsManifestUrl
+// but no DASH adaptiveFormats list. YouTube's stream-availability system
+// normally learns about HLS tracks through:
+//   -[MLHLSStreamSelector didLoadHLSMasterPlaylist:] → %delegate streamSelectorHasSelectableVideoFormats:
+//
+// The original YTUHD hook used KVC key @"_completeMasterPlaylist" which
+// returns nil in 21.20.4 (ivar was renamed), so the delegate was called with
+// an empty array → Code=2 "No stream" in the UI even though AVPlayer was
+// buffering segments successfully in the background.
+//
+// Fix: arg1 IS the master playlist — use it directly, no KVC.
+// ---------------------------------------------------------------------------
+%hook MLHLSStreamSelector
+- (void)didLoadHLSMasterPlaylist:(MLHLSMasterPlaylist *)playlist {
+    %orig;
+    NSArray *variants = [playlist remotePlaylists];
+    if (variants.count > 0)
+        [[self delegate] streamSelectorHasSelectableVideoFormats:variants];
+}
 %end
 
 %ctor {

@@ -48,6 +48,9 @@ extern BOOL FixPlayback();
 @interface YTIOSGuardSnapshotControllerImpl : NSObject
 @end
 
+@interface IGDPOTokenMinter : NSObject
+@end
+
 static void forceRenderViewTypeBase(YTIHamplayerConfig *hamplayerConfig) {
     if (!hamplayerConfig) return;
     hamplayerConfig.renderViewType = 2;
@@ -201,22 +204,57 @@ static void forceRenderViewType(YTHotConfig *hotConfig) {
 // Fix B: Strip error from attestation response handler (fallback).
 // ---------------------------------------------------------------------------
 %hook YTHotConfig
+// Kill-switch: disable the entire iOS PO token system.
 - (BOOL)iosClientGlobalConfigDisableIosPoTokens { return YES; }
+// Prevent the PO token manager from initialising at app startup.
+// Without this, the manager fires one background iosantiabuse exchange
+// *before* the lazy flags above are checked, causing a 400 that sets
+// "no token available" state and starts the ~5 s SABR kill timer.
+- (BOOL)iosPlayerClientSharedConfigEnablePoTokenManagerInitializationOnStartup { return NO; }
+// Delay minter initialisation indefinitely — belt-and-suspenders for startup.
+- (BOOL)iosPlayerClientSharedConfigDelayPoTokenMinterInitialization { return YES; }
+// Disable per-format-type PO token injection and CABR mode.
 - (BOOL)iosPlayerClientSharedConfigEnablePoTokenManagerMedia { return NO; }
 - (BOOL)iosPlayerClientSharedConfigEnablePoTokenManagerInjection { return NO; }
 - (BOOL)iosPlayerClientSharedConfigIosSpsEnablePoTokenCabr { return NO; }
 %end
 
 %hook YTIOSGuardSnapshotControllerImpl
-// Strip the attestation error before it reaches the SABR-kill logic.
-// Passing nil for response + error simulates "no snapshot obtained, no
-// error" — the caller skips the failure path and does not abort the stream.
+// Swallow the attestation response entirely — do not call %orig and do not
+// invoke the completion handler.  Calling %orig(nil, nil, …) was still
+// advancing the failure state machine (the original impl treats a nil
+// response + nil error as an undefined state and raised its own error).
+// Leaving the completion handler uncalled means no "token failed" signal
+// ever reaches the SABR kill-timer, so the stream is not aborted.
 - (void)handleAttestationChallengeResponse:(id)response
                                      error:(NSError *)error
                                    videoID:(NSString *)videoID
                                 identityID:(NSString *)identityID
                          completionHandler:(id)completionHandler {
-    %orig(nil, nil, videoID, identityID, completionHandler);
+    // intentionally a no-op
+}
+%end
+
+%hook IGDPOTokenMinter
+// Intercept every minting call and report a successful (but empty) token.
+// GVS does not enforce PO token values server-side — all videoplayback
+// segments return 200 regardless.  The only check is whether the internal
+// token state is non-nil; supplying empty NSData satisfies that check and
+// prevents the ~5 s "no token available" SABR grace-timer from firing.
+- (void)mintPOTokenImmediately:(id)completionHandler {
+    if (completionHandler)
+        ((void (^)(NSData *, NSError *))completionHandler)([NSData data], nil);
+}
+- (void)mintPOTokenAfterUpdate:(id)update completionQueue:(id)queue completionHandler:(id)completionHandler {
+    if (completionHandler)
+        ((void (^)(NSData *, NSError *))completionHandler)([NSData data], nil);
+}
+- (void)mintPoTokenAfterUpdate:(id)update callOnQueue:(id)queue completionHandler:(id)completionHandler {
+    if (completionHandler)
+        ((void (^)(NSData *, NSError *))completionHandler)([NSData data], nil);
+}
+- (void)mintUninitializedPoToken:(id)token initializationCalled:(BOOL)initializationCalled {
+    // no-op — never report an uninitialised-token error
 }
 %end
 
@@ -251,8 +289,9 @@ static void forceRenderViewType(YTHotConfig *hotConfig) {
 %hook YTMainAppVideoPlayerOverlayViewController
 - (void)handleError:(NSError *)error {
     if (FixPlayback()
-        && error.code == 2
-        && [error.domain isEqualToString:@"com.google.ios.youtube.ErrorDomain.playback"])
+        && [error.domain isEqualToString:@"com.google.ios.youtube.ErrorDomain.playback"]
+        && (error.code == 2   // "No stream" — AVPlayer found no HLS URL
+            || error.code == 14)) // "Something went wrong" — PO token grace-timer abort
         return;
     %orig;
 }

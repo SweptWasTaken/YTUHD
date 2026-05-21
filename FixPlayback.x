@@ -337,14 +337,28 @@ static void forceRenderViewType(YTHotConfig *hotConfig) {
     IMP yesIMP = imp_implementationWithBlock(^BOOL(__unused id _self) { return YES; });
     IMP noIMP  = imp_implementationWithBlock(^BOOL(__unused id _self) { return NO;  });
 
-    unsigned int count = 0;
-    Class *classes = objc_copyClassList(&count);
-    for (unsigned int i = 0; i < count; i++) {
+    // IMPORTANT: use class_copyMethodList, NOT class_getInstanceMethod.
+    // class_getInstanceMethod calls lookUpImpOrForward which triggers +initialize
+    // on any class that hasn't been initialised yet.  At dyld init time (our %ctor)
+    // many YouTube classes have +initialize methods that touch global state which
+    // doesn't exist yet → SIGSEGV at 0x0 on the main thread.
+    // class_copyMethodList reads the method-list array directly from memory and
+    // never sends any ObjC messages, so it is safe to call before +initialize.
+    unsigned int classCount = 0;
+    Class *classes = objc_copyClassList(&classCount);
+    for (unsigned int i = 0; i < classCount; i++) {
         Class cls = classes[i];
-        if (class_getInstanceMethod(cls, hasPoTokenSel))
-            class_replaceMethod(cls, hasPoTokenSel, yesIMP, "B@:");
-        if (class_getInstanceMethod(cls, isIosguardEnabledSel))
-            class_replaceMethod(cls, isIosguardEnabledSel, noIMP, "B@:");
+        unsigned int methodCount = 0;
+        Method *methods = class_copyMethodList(cls, &methodCount);
+        if (!methods) continue;
+        for (unsigned int j = 0; j < methodCount; j++) {
+            SEL sel = method_getName(methods[j]);
+            if (sel == hasPoTokenSel)
+                class_replaceMethod(cls, hasPoTokenSel, yesIMP, "B@:");
+            else if (sel == isIosguardEnabledSel)
+                class_replaceMethod(cls, isIosguardEnabledSel, noIMP, "B@:");
+        }
+        free(methods);
     }
     free(classes);
 }

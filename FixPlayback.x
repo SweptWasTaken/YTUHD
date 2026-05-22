@@ -221,6 +221,12 @@ static void forceRenderViewType(YTHotConfig *hotConfig) {
 // If a stored challenge exists, reuse it (prevents new iosantiabuse calls
 // on session restarts triggered by seeks).
 - (BOOL)iosPlayerClientSharedConfigShouldReuseIosguardChallengeForAttestation { return YES; }
+// Prevent the mid-playback iosguard refresh that fires ~15s into a stream.
+// Confirmed via HAR: a second iosantiabuse call appears at t+15s during active
+// playback.  That 400 response caches a fresh "token invalid" C++ state which
+// is read when the next SABR session starts after a seek → triggers the
+// 10-second watchtime kill on the restarted session.
+- (BOOL)iosPlayerClientSharedConfigRequestIosguardDataAfterPlaybackStarts { return NO; }
 %end
 
 %hook iOSGuardManager
@@ -320,45 +326,47 @@ static void forceRenderViewType(YTHotConfig *hotConfig) {
     if (!FixPlayback()) return;
     %init;
 
-    // Runtime enumeration fallback: hook hasPoToken and isIosguardAttestationEnabled
-    // on EVERY ObjC class that responds to them, regardless of class name.
+    // Runtime enumeration: hook hasPoToken and isIosguardAttestationEnabled on
+    // every ObjC class that has them, regardless of class name.
     //
-    // hasPoToken: proto-generated boolean getter checked at the 10-second watchtime
-    // mark.  If it returns NO at that point YouTube kills the SABR stream ~1 second
-    // later.  We force it to YES so the watchtime guard sees a valid token.
+    // WHY dispatch_async instead of running inline in %ctor:
+    // %ctor runs at dyld initialiser time — before the main run loop starts and
+    // before many proto-generated GPBMessage subclasses have been registered
+    // with the ObjC runtime.  class_copyMethodList at that point misses those
+    // classes, so the replacement never lands.  Dispatching to the main queue
+    // defers until the first main-run-loop tick (i.e. after UIApplicationMain
+    // returns control, well before the user can open any video).  By that point
+    // 100% of ObjC classes are registered and all +initialize methods have run.
     //
-    // isIosguardAttestationEnabled: controls whether iOSGuard fires an iosantiabuse
-    // attestation request.  The static %hook iOSGuardManager above covers the
-    // expected class, but the actual instance may live on a differently-named class;
-    // this sweep catches every class that has the selector.
-    SEL hasPoTokenSel          = @selector(hasPoToken);
-    SEL isIosguardEnabledSel   = @selector(isIosguardAttestationEnabled);
+    // hasPoToken: proto-generated presence check fired at the 10-second watchtime
+    // mark.  Returning YES prevents the SABR kill timer from arming.
+    //
+    // isIosguardAttestationEnabled: returning NO stops iOSGuard from ever issuing
+    // an iosantiabuse challenge request.  The static %hook iOSGuardManager covers
+    // the expected name; this sweep catches any differently-named class.
+    dispatch_async(dispatch_get_main_queue(), ^{
+        SEL hasPoTokenSel        = @selector(hasPoToken);
+        SEL isIosguardEnabledSel = @selector(isIosguardAttestationEnabled);
 
-    IMP yesIMP = imp_implementationWithBlock(^BOOL(__unused id _self) { return YES; });
-    IMP noIMP  = imp_implementationWithBlock(^BOOL(__unused id _self) { return NO;  });
+        IMP yesIMP = imp_implementationWithBlock(^BOOL(__unused id _self) { return YES; });
+        IMP noIMP  = imp_implementationWithBlock(^BOOL(__unused id _self) { return NO;  });
 
-    // IMPORTANT: use class_copyMethodList, NOT class_getInstanceMethod.
-    // class_getInstanceMethod calls lookUpImpOrForward which triggers +initialize
-    // on any class that hasn't been initialised yet.  At dyld init time (our %ctor)
-    // many YouTube classes have +initialize methods that touch global state which
-    // doesn't exist yet → SIGSEGV at 0x0 on the main thread.
-    // class_copyMethodList reads the method-list array directly from memory and
-    // never sends any ObjC messages, so it is safe to call before +initialize.
-    unsigned int classCount = 0;
-    Class *classes = objc_copyClassList(&classCount);
-    for (unsigned int i = 0; i < classCount; i++) {
-        Class cls = classes[i];
-        unsigned int methodCount = 0;
-        Method *methods = class_copyMethodList(cls, &methodCount);
-        if (!methods) continue;
-        for (unsigned int j = 0; j < methodCount; j++) {
-            SEL sel = method_getName(methods[j]);
-            if (sel == hasPoTokenSel)
-                class_replaceMethod(cls, hasPoTokenSel, yesIMP, "B@:");
-            else if (sel == isIosguardEnabledSel)
-                class_replaceMethod(cls, isIosguardEnabledSel, noIMP, "B@:");
+        unsigned int classCount = 0;
+        Class *classes = objc_copyClassList(&classCount);
+        for (unsigned int i = 0; i < classCount; i++) {
+            Class cls = classes[i];
+            unsigned int methodCount = 0;
+            Method *methods = class_copyMethodList(cls, &methodCount);
+            if (!methods) continue;
+            for (unsigned int j = 0; j < methodCount; j++) {
+                SEL sel = method_getName(methods[j]);
+                if (sel == hasPoTokenSel)
+                    class_replaceMethod(cls, hasPoTokenSel, yesIMP, "B@:");
+                else if (sel == isIosguardEnabledSel)
+                    class_replaceMethod(cls, isIosguardEnabledSel, noIMP, "B@:");
+            }
+            free(methods);
         }
-        free(methods);
-    }
-    free(classes);
+        free(classes);
+    });
 }

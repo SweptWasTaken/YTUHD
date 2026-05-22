@@ -195,14 +195,95 @@ static void forceRenderViewType(YTHotConfig *hotConfig) {
 %end
 
 // ---------------------------------------------------------------------------
+// iosantiabuse network intercept (NSURLProtocol)
+//
+// Root cause of the 4-second SABR kill (confirmed via HAR analysis):
+//
+//   iosantiabuse-pa.googleapis.com/v1/exchange returns 400 "Precondition
+//   check failed" because LiveContainer2 re-signs YouTube with Team ID
+//   LSMHR68PG6 instead of YouTube's real Team ID, so AppAttest fails server-
+//   side.  The C++ iosguard layer inside YouTube parses that 400 HTTP status
+//   BEFORE any ObjC code runs, and writes a "exchange failed" state into a
+//   C++ global.  When the NEXT SABR session starts (e.g. after the user
+//   switches videos), the session reads the cached C++ failure and arms a
+//   4-second kill timer that bypasses the ObjC hasPoToken check entirely.
+//   Confirmed: qoe:mta fires at exactly 4.08 s after video 2 SABR start,
+//   while video 1 (whose SABR started BEFORE iosantiabuse returned) plays
+//   fine.
+//
+// Fix: intercept at NSURLProtocol level, replacing the 400 with a synthetic
+// 200 + minimal proto body before the bytes reach any C++ code.  The C++
+// exchange handler sees status 200, transitions to "succeeded", never writes
+// the failure state, and no kill timer is armed.
+//
+// The fake token is proto field 1 (bytes) = 8 zero bytes.  GVS does not
+// validate token content server-side — all videoplayback and initplayback
+// requests return 200 regardless of token value (confirmed across all HARs).
+// ---------------------------------------------------------------------------
+@interface YTUHDAntiAbuseProtocol : NSURLProtocol
+@end
+
+@implementation YTUHDAntiAbuseProtocol
+
++ (BOOL)canInitWithRequest:(NSURLRequest *)request {
+    if ([NSURLProtocol propertyForKey:@"YTUHDHandled" inRequest:request])
+        return NO;
+    return [request.URL.host hasSuffix:@"iosantiabuse-pa.googleapis.com"];
+}
+
++ (NSURLRequest *)canonicalRequestForRequest:(NSURLRequest *)request {
+    return request;
+}
+
++ (BOOL)requestIsCacheEquivalent:(NSURLRequest *)a toRequest:(NSURLRequest *)b {
+    return [super requestIsCacheEquivalent:a toRequest:b];
+}
+
+- (void)startLoading {
+    // Proto: field 1 (bytes), length 8, eight zero bytes.
+    // C++ sees 200 + non-error proto → "exchange succeeded, token = [8 zeros]".
+    // Token value is never validated client-side or server-side.
+    static const uint8_t kBody[] = { 0x0a, 0x08, 0, 0, 0, 0, 0, 0, 0, 0 };
+    NSData *body = [NSData dataWithBytes:kBody length:sizeof(kBody)];
+    NSHTTPURLResponse *response = [[NSHTTPURLResponse alloc]
+        initWithURL:self.request.URL
+         statusCode:200
+        HTTPVersion:@"HTTP/2.0"
+       headerFields:@{@"Content-Type":  @"application/x-protobuf",
+                      @"Cache-Control": @"no-store"}];
+    [self.client URLProtocol:self
+          didReceiveResponse:response
+          cacheStoragePolicy:NSURLCacheStorageNotAllowed];
+    [self.client URLProtocol:self didLoadData:body];
+    [self.client URLProtocolDidFinishLoading:self];
+}
+
+- (void)stopLoading {}
+
+@end
+
+// Inject YTUHDAntiAbuseProtocol into every NSURLSessionConfiguration so it
+// is active for all NSURLSession instances YouTube creates, including custom
+// and ephemeral sessions that ignore +[NSURLProtocol registerClass:].
+%hook NSURLSessionConfiguration
+- (NSArray *)protocolClasses {
+    NSMutableArray *classes = [[NSMutableArray alloc] initWithArray:(%orig ?: @[])];
+    Class proto = [YTUHDAntiAbuseProtocol class];
+    if (![classes containsObject:proto])
+        [classes insertObject:proto atIndex:0];
+    return classes;
+}
+%end
+
+// ---------------------------------------------------------------------------
 // PO Token bypass
 //
 // Confirmed via HAR: LiveContainer2 Team ID LSMHR68PG6 is embedded in the
 // Apple AppAttest payload sent to iosantiabuse-pa.googleapis.com/v1/exchange.
-// Google rejects it (400 "Precondition check failed.") because it's not
-// YouTube's real Team ID.  After 9 consecutive 400s the YouTube app aborts
-// the SABR stream (status 999) and shows Code=14.  GVS CDN serves all
-// segments at 200 without PO token enforcement — the app itself kills.
+// The NSURLProtocol intercept above prevents the 400 from ever reaching C++.
+// The hooks below are belt-and-suspenders for any code paths that bypass the
+// URL loading system, and to prevent the token manager from spinning up and
+// making unnecessary attestation requests.
 //
 // Fix A: Disable PO token system via YTHotConfig flags (primary).
 // Fix B: Strip error from attestation response handler (fallback).
@@ -325,6 +406,9 @@ static void forceRenderViewType(YTHotConfig *hotConfig) {
 %ctor {
     if (!FixPlayback()) return;
     %init;
+    // Belt-and-suspenders registration for NSURLConnection and any session
+    // using the default URL loading system (complements the configuration hook).
+    [NSURLProtocol registerClass:[YTUHDAntiAbuseProtocol class]];
 
     // Runtime enumeration: hook hasPoToken and isIosguardAttestationEnabled on
     // every ObjC class that has them, regardless of class name.

@@ -81,25 +81,25 @@ jobs:
           draft: true
 
   # -----------------------------------------------------------------------
-  # After YTUHD builds successfully, kick off a full IPA rebuild in
-  # SweptWasTaken/YTLitePlusEXTRA so the sideloaded IPA always reflects
-  # the latest YTUHD code without manual intervention.
+  # After YTUHD builds successfully, kick off a fresh debug IPA build in
+  # Swept-Forks/YTLite so the sideloaded debug IPA always reflects the
+  # latest YTUHD code without any manual intervention.
   #
   # Requires a secret named DISPATCH_TOKEN in this repo — a GitHub
   # fine-grained PAT (or classic PAT with repo scope) that has
-  # "Actions: write" permission on SweptWasTaken/YTLitePlusEXTRA.
+  # "Actions: write" permission on Swept-Forks/YTLite.
   # -----------------------------------------------------------------------
-  trigger-ytliteplus:
-    name: Trigger YTLitePlusEXTRA rebuild
+  trigger-ytlite:
+    name: Trigger YTLite debug rebuild
     needs: build
     runs-on: ubuntu-latest
     if: success()
     steps:
-      - name: Dispatch repository_dispatch to YTLitePlusEXTRA
+      - name: Dispatch repository_dispatch to Swept-Forks/YTLite
         run: |
           curl -X POST \
             -H "Authorization: Bearer ${{ secrets.DISPATCH_TOKEN }}" \
             -H "Accept: application/vnd.github.v3+json" \
-            https://api.github.com/repos/SweptWasTaken/YTLitePlusEXTRA/dispatches \
+            https://api.github.com/repos/Swept-Forks/YTLite/dispatches \
             -d '{"event_type":"trigger-build"}' \
             --fail-with-body

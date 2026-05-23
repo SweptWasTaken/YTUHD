@@ -84,6 +84,95 @@ static void forceRenderViewType(YTHotConfig *hotConfig) {
 }
 
 // ---------------------------------------------------------------------------
+// Runtime diagnostic dump
+//
+// Every time makeAVPlayer() fires, YTUHDDump() serialises the full property
+// graph of MLVideo and MLInnerTubePlayerConfig (3 levels deep) to a
+// timestamped text file in the app's Documents folder.
+//
+// To read the file:
+//   FLEX toolbar → filesystem icon → navigate to Documents →
+//   open ytuhd_<unix-timestamp>.txt
+//
+// Each video-load attempt appends a new file so you can compare across tries.
+// The dump is wrapped in @try so it can never crash the player.
+// ---------------------------------------------------------------------------
+
+static NSString *YTUHDDescribeValue(id val, int depth);
+
+static NSString *YTUHDDescribeObject(id obj, int depth) {
+    if (!obj) return @"nil";
+    NSMutableString *out = [NSMutableString string];
+    [out appendFormat:@"[%@]", NSStringFromClass([obj class])];
+    if (depth <= 0) return out;
+    [out appendString:@"\n"];
+    NSMutableSet *seen = [NSMutableSet set];
+    for (Class cls = [obj class]; cls && cls != [NSObject class]; cls = [cls superclass]) {
+        unsigned int n = 0;
+        objc_property_t *list = class_copyPropertyList(cls, &n);
+        for (unsigned int i = 0; i < n; i++) {
+            NSString *name = @(property_getName(list[i]));
+            if ([seen containsObject:name]) continue;
+            [seen addObject:name];
+            id val = nil;
+            @try { val = [obj valueForKey:name]; }
+            @catch (...) { [out appendFormat:@"  .%@ = <kvc-err>\n", name]; continue; }
+            [out appendFormat:@"  .%@ = %@\n", name, YTUHDDescribeValue(val, depth - 1)];
+        }
+        free(list);
+    }
+    return out;
+}
+
+static NSString *YTUHDDescribeValue(id val, int depth) {
+    if (!val)                                    return @"nil";
+    if ([val isKindOfClass:[NSString class]])     return (NSString *)val;
+    if ([val isKindOfClass:[NSNumber class]])     return [val stringValue];
+    if ([val isKindOfClass:[NSURL class]])        return [(NSURL *)val absoluteString];
+    if ([val isKindOfClass:[NSData class]])       return [NSString stringWithFormat:@"<Data %lu B>",
+                                                       (unsigned long)[(NSData *)val length]];
+    if ([val isKindOfClass:[NSArray class]]) {
+        NSArray *a = val;
+        if (!a.count) return @"[]";
+        if (depth <= 0) return [NSString stringWithFormat:@"[%lu items]", (unsigned long)a.count];
+        NSMutableString *r = [NSMutableString stringWithFormat:@"[%lu]\n", (unsigned long)a.count];
+        NSUInteger lim = MIN(a.count, 5u);
+        for (NSUInteger j = 0; j < lim; j++)
+            [r appendFormat:@"    [%lu] %@\n", (unsigned long)j, YTUHDDescribeValue(a[j], depth - 1)];
+        if (a.count > lim) [r appendFormat:@"    ...+%lu more\n", (unsigned long)(a.count - lim)];
+        return r;
+    }
+    if ([val isKindOfClass:[NSDictionary class]])
+        return [NSString stringWithFormat:@"<Dict %lu keys>", (unsigned long)[(NSDictionary *)val count]];
+    if ([val isKindOfClass:[NSObject class]]) {
+        if (depth <= 0) return [NSString stringWithFormat:@"[%@]", NSStringFromClass([val class])];
+        NSString *inner = YTUHDDescribeObject(val, depth - 1);
+        NSMutableString *indented = [NSMutableString string];
+        for (NSString *line in [inner componentsSeparatedByString:@"\n"])
+            if (line.length) [indented appendFormat:@"    %@\n", line];
+        return [NSString stringWithFormat:@"\n%@", indented];
+    }
+    return [val description];
+}
+
+static void YTUHDDump(MLVideo *video, MLInnerTubePlayerConfig *config) {
+    @try {
+        NSMutableString *buf = [NSMutableString string];
+        [buf appendFormat:@"YTUHD dump %@\n\n", [NSDate date]];
+        [buf appendString:@"=== MLVideo ===\n"];
+        [buf appendString:YTUHDDescribeObject(video,  3)];
+        [buf appendString:@"\n=== MLInnerTubePlayerConfig ===\n"];
+        [buf appendString:YTUHDDescribeObject(config, 3)];
+        NSString *docs = NSSearchPathForDirectoriesInDomains(
+            NSDocumentDirectory, NSUserDomainMask, YES)[0];
+        NSString *name = [NSString stringWithFormat:@"ytuhd_%.0f.txt",
+            [[NSDate date] timeIntervalSince1970]];
+        [buf writeToFile:[docs stringByAppendingPathComponent:name]
+              atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    } @catch (...) { /* never crash the player */ }
+}
+
+// ---------------------------------------------------------------------------
 // makeAVPlayer — bypass HAMPlayer entirely
 //
 // renderViewType=2 only switches HAMPlayer's *rendering surface* to AVPlayer;
@@ -108,6 +197,7 @@ static MLAVPlayer *makeAVPlayer(id self,
                                 MLVideo *video,
                                 MLInnerTubePlayerConfig *playerConfig,
                                 MLPlayerStickySettings *stickySettings) {
+    YTUHDDump(video, playerConfig); // writes ytuhd_<ts>.txt to Documents
     BOOL ext = [(MLAVPlayer *)[self valueForKey:@"_activePlayer"] externalPlaybackActive];
     MLAVPlayer *player = [[%c(MLAVPlayer) alloc]
         initWithVideo:video

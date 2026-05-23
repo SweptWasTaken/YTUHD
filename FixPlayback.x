@@ -55,12 +55,6 @@ extern BOOL FixPlayback();
 @interface iOSGuardManager : NSObject
 @end
 
-// Forward-declare only the two MLVideo members we use so the compiler
-// accepts typed calls without importing the full header.
-@interface MLVideo : NSObject
-- (NSString *)videoID;
-- (MLStreamingData *)streamingData;
-@end
 
 
 static void forceRenderViewTypeBase(YTIHamplayerConfig *hamplayerConfig) {
@@ -275,6 +269,12 @@ static void ytuhd_injectHLSURL(MLStreamingData *sd, NSString *urlString) {
     if (!sd || !urlString.length) return;
     SEL setter = @selector(setHlsManifestURL:);
 
+    // setHlsManifestURL: returns void so there is no actual leak, but ARC
+    // can't prove that without a visible declaration.  Suppress the warning
+    // for the whole injection function.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+
     // Strategy 1: known ivar key names.
     for (NSString *key in @[@"_streamingData", @"_proto", @"_data",
                              @"streamingData",  @"innerStreamingData",
@@ -283,7 +283,7 @@ static void ytuhd_injectHLSURL(MLStreamingData *sd, NSString *urlString) {
             id inner = [sd valueForKey:key];
             if (inner && [inner respondsToSelector:setter]) {
                 [inner performSelector:setter withObject:urlString];
-                return;
+                goto done;
             }
         } @catch (...) {}
     }
@@ -303,7 +303,7 @@ static void ytuhd_injectHLSURL(MLStreamingData *sd, NSString *urlString) {
                 if (val && [val respondsToSelector:setter]) {
                     [val performSelector:setter withObject:urlString];
                     free(ivars);
-                    return;
+                    goto done;
                 }
             } @catch (...) {}
         }
@@ -315,6 +315,9 @@ static void ytuhd_injectHLSURL(MLStreamingData *sd, NSString *urlString) {
         if ([sd respondsToSelector:setter])
             [sd performSelector:setter withObject:urlString];
     } @catch (...) {}
+
+done:;
+#pragma clang diagnostic pop
 }
 
 // ---------------------------------------------------------------------------
@@ -349,10 +352,17 @@ static MLAVPlayer *makeAVPlayer(id self,
     // If the IOS client gave us no HLS URL (typical since YouTube removed
     // hlsManifestUrl from IOS responses in favour of SABR), fetch one
     // ourselves as WEB_EMBEDDED_PLAYER, which always returns hlsManifestUrl.
-    MLStreamingData *sd = [video streamingData];
-    if (sd && ![sd HLSMasterPlaylistURL]) {
+    //
+    // Use KVC throughout: MLVideo and MLStreamingData headers don't publicly
+    // expose every method we need, and KVC avoids "no visible @interface"
+    // errors while staying safe (wrapped in @try).
+    MLStreamingData *sd = nil;
+    @try { sd = [video valueForKey:@"streamingData"]; } @catch (...) {}
+    NSURL *existingHLS = nil;
+    @try { existingHLS = [sd valueForKey:@"HLSMasterPlaylistURL"]; } @catch (...) {}
+    if (sd && !existingHLS) {
         NSString *videoID = nil;
-        @try { videoID = [video videoID]; } @catch (...) {}
+        @try { videoID = [video valueForKey:@"videoID"]; } @catch (...) {}
         if (!videoID.length) @try { videoID = [video valueForKey:@"ID"]; } @catch (...) {}
         if (videoID.length) {
             NSString *hlsURL = ytuhd_fetchHLSURL(videoID);

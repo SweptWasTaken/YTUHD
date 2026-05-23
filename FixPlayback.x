@@ -58,6 +58,18 @@ extern BOOL FixPlayback();
 static void forceRenderViewTypeBase(YTIHamplayerConfig *hamplayerConfig) {
     if (!hamplayerConfig) return;
     hamplayerConfig.renderViewType = 2;
+    // Zero out VP9 and AV1 max resolution in the HAMPlayer stream filter.
+    // This tells HAMPlayer's format selector that no VP9 or AV1 stream has a
+    // valid resolution, effectively disabling both codecs.  Without them,
+    // HAMPlayer falls back to H.264 (video) and AAC (audio) — native iOS
+    // hardware codecs that do not carry the WebM/Opus PO token enforcement.
+    YTIHamplayerStreamFilter *filter = hamplayerConfig.streamFilter;
+    if (filter) {
+        filter.vp9.maxArea = 0;
+        filter.vp9.maxFps  = 0;
+        filter.av1.maxArea = 0;
+        filter.av1.maxFps  = 0;
+    }
 }
 
 static void forceRenderViewTypeHot(YTIHamplayerHotConfig *hamplayerHotConfig) {
@@ -224,6 +236,76 @@ static void forceRenderViewType(YTHotConfig *hotConfig) {
     return %orig;
 }
 
+%end
+
+// ---------------------------------------------------------------------------
+// WebM/Opus format filter — ABR policy level
+//
+// GVS 403s DASH segments that carry the `spc` (Stream Protection Context)
+// parameter when no valid PO token was provided at session init.  In the
+// current YouTube 21.x enforcement regime this hits WebM/VP9 video and
+// WebM/Opus audio (itag=251) segments for the IOS client.  Native iOS
+// codecs (H.264 video, AAC audio) currently do not trigger enforcement.
+//
+// The stream filter in forceRenderViewTypeBase zeroes VP9/AV1 max area,
+// which prevents HAMPlayer from ever proposing those formats.  These ABR
+// policy hooks are belt-and-suspenders: they run AFTER format list
+// assembly and strip any remaining WebM format before the ABR algorithm
+// makes a selection.  The check is purely on the URL's MIME query param —
+// no enum magic required.
+//
+// Note: Tweak.xm's equivalent hooks are skipped when FixPlayback()=YES
+// (see Tweak.xm %ctor guard), so these hooks must live here.
+// ---------------------------------------------------------------------------
+static NSArray *dropWebM(NSArray *formats) {
+    if (!formats.count) return formats;
+    return [formats filteredArrayUsingPredicate:
+        [NSPredicate predicateWithBlock:
+            ^BOOL(MLFormat *fmt, NSDictionary *__unused bindings) {
+                if (![fmt isKindOfClass:[MLFormat class]]) return YES;
+                NSString *urlStr = [[fmt URL] absoluteString];
+                if (!urlStr) return YES;
+                // MIME type appears in the URL as mime=audio/webm or
+                // mime=video/webm (slash is typically unencoded in query params).
+                if ([urlStr rangeOfString:@"mime=audio/webm"
+                                 options:NSCaseInsensitiveSearch].location != NSNotFound)
+                    return NO;
+                if ([urlStr rangeOfString:@"mime=video/webm"
+                                 options:NSCaseInsensitiveSearch].location != NSNotFound)
+                    return NO;
+                // Percent-encoded variants (belt-and-suspenders).
+                if ([urlStr rangeOfString:@"mime=audio%2Fwebm"
+                                 options:NSCaseInsensitiveSearch].location != NSNotFound)
+                    return NO;
+                if ([urlStr rangeOfString:@"mime=video%2Fwebm"
+                                 options:NSCaseInsensitiveSearch].location != NSNotFound)
+                    return NO;
+                return YES;
+            }]];
+}
+
+%hook MLABRPolicy
+- (void)setFormats:(NSArray *)formats { %orig(dropWebM(formats)); }
+%end
+
+%hook MLABRPolicyOld
+- (void)setFormats:(NSArray *)formats { %orig(dropWebM(formats)); }
+%end
+
+%hook MLABRPolicyNew
+- (void)setFormats:(NSArray *)formats { %orig(dropWebM(formats)); }
+%end
+
+%hook HAMDefaultABRPolicy
+- (NSArray *)filterFormats:(NSArray *)formats { return dropWebM(%orig); }
+- (id)getSelectableFormatDataAndReturnError:(NSError **)error {
+    [self setValue:@(NO) forKey:@"_postponePreferredFormatFiltering"];
+    return dropWebM(%orig);
+}
+- (void)setFormats:(NSArray *)formats {
+    [self setValue:@(YES) forKey:@"_postponePreferredFormatFiltering"];
+    %orig(dropWebM(formats));
+}
 %end
 
 // ---------------------------------------------------------------------------

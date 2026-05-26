@@ -57,6 +57,7 @@ extern BOOL FixPlayback();
 
 
 
+__attribute__((unused))
 static void forceRenderViewTypeBase(YTIHamplayerConfig *hamplayerConfig) {
     if (!hamplayerConfig) return;
     hamplayerConfig.renderViewType = 2;
@@ -74,11 +75,13 @@ static void forceRenderViewTypeBase(YTIHamplayerConfig *hamplayerConfig) {
     }
 }
 
+__attribute__((unused))
 static void forceRenderViewTypeHot(YTIHamplayerHotConfig *hamplayerHotConfig) {
     if (!hamplayerHotConfig) return;
     hamplayerHotConfig.renderViewType = 2;
 }
 
+__attribute__((unused))
 static void forceRenderViewType(YTHotConfig *hotConfig) {
     YTIHamplayerHotConfig *hamplayerHotConfig = [hotConfig hamplayerHotConfig];
     forceRenderViewTypeHot(hamplayerHotConfig);
@@ -387,26 +390,22 @@ done:;
 }
 
 // ---------------------------------------------------------------------------
-// makeAVPlayer — bypass HAMPlayer entirely
+// makeAVPlayer — kept for potential future use; NOT called by any hook.
 //
-// renderViewType=2 only switches HAMPlayer's *rendering surface* to AVPlayer;
-// HAMPlayer itself still handles all network fetching via Cronet using DASH
-// segment URLs.  Those DASH URLs carry an `spc` (Stream Protection Context)
-// parameter that GVS enforces for the IOS client — all DASH formats (H.264,
-// AAC, VP9, AV1) are 403'd when no valid PO token was provided at player-
-// request time.
+// Out-of-band HLS fetch via ytuhd_fetchHLSURL was abandoned: all three client
+// types (WEB_EMBEDDED_PLAYER, MWEB, TVHTML5) returned HTTP 200 but empty
+// streamingData (no hlsManifestUrl, no serverAbrStreamingUrl).  YouTube's
+// InnerTube API now requires the app's own Cronet-managed auth cookies/tokens
+// for any player request to succeed; our standalone NSURLSession calls have
+// no access to Cronet's cookie store and are bot-detected server-side.
 //
-// The fix is to skip HAMPlayer entirely and create MLAVPlayer, which uses
-// Apple's AVFoundation stack (NSURLSession, not Cronet) to load the
-// hlsManifestUrl returned by the TVHTML5-spoofed player request.  HLS segment
-// URLs do not carry `spc` enforcement.
-//
-// MLAVPlayer.initWithVideo:playerConfig:stickySettings:externalPlaybackActive:
-// is confirmed present in PoomSmart/YouTubeHeader and in the YouTube 21.20.4
-// binary.  The pool stores the returned player as _activePlayer; the
-// playerViewForVideo: companion call creates a matching AVPlayer layer view
-// via MLDefaultPlayerViewFactory.AVPlayerViewForVideo:playerConfig:.
+// Current strategy: let HAMPlayer run (call %orig in acquirePlayerForVideo),
+// disable SABR via useServerDrivenAbr=NO so HAMPlayer uses client-side DASH
+// ABR instead.  Only H.264/AAC streams survive the dropWebM filter, so
+// HAMPlayer never attempts the WebM/Opus (itag=251) segments that originally
+// triggered the PO-token 403 enforcement.
 // ---------------------------------------------------------------------------
+__attribute__((unused))
 static MLAVPlayer *makeAVPlayer(id self,
                                 MLVideo *video,
                                 MLInnerTubePlayerConfig *playerConfig,
@@ -452,13 +451,26 @@ externalPlaybackActive:ext];
 
 %hook MLPlayerPoolImpl
 
+// Let HAMPlayer run normally.  SABR is disabled by the YTIMediaCommonConfig
+// hook below; we also write useServerDrivenAbr=NO directly on the proto object
+// here in case HAMPlayer's C++ layer reads it via the C++ proto API (which
+// bypasses ObjC hooks).  With SABR off, HAMPlayer falls back to client-side
+// DASH ABR using the adaptiveStreams list — the dropWebM/MLStreamingData hooks
+// strip out every WebM/Opus format first, so HAMPlayer can only select H.264
+// video and AAC audio tracks, neither of which currently triggers GVS PO-token
+// enforcement for the IOS client.
 - (id)acquirePlayerForVideo:(MLVideo *)video playerConfig:(MLInnerTubePlayerConfig *)playerConfig stickySettings:(MLPlayerStickySettings *)stickySettings latencyLogger:(id)latencyLogger reloadContext:(id)reloadContext mediaPlayerResources:(id)mediaPlayerResources recompositeProvider:(id)recompositeProvider {
-    return makeAVPlayer(self, video, playerConfig, stickySettings);
+    YTUHDDump(video, playerConfig);
+    @try {
+        id mcc = [[playerConfig playerConfig] mediaCommonConfig];
+        if ([mcc respondsToSelector:@selector(setUseServerDrivenAbr:)])
+            [mcc setUseServerDrivenAbr:NO];
+    } @catch (...) {}
+    return %orig;
 }
 
 - (id)playerViewForVideo:(MLVideo *)video playerConfig:(MLInnerTubePlayerConfig *)playerConfig mediaPlayerResources:(id)mediaPlayerResources {
-    MLDefaultPlayerViewFactory *factory = [self valueForKey:@"_playerViewFactory"];
-    return [factory AVPlayerViewForVideo:video playerConfig:playerConfig];
+    return %orig;
 }
 
 - (BOOL)canQueuePlayerPlayVideo:(MLVideo *)video playerConfig:(MLInnerTubePlayerConfig *)playerConfig reloadContext:(id)reloadContext error:(NSError **)error {
@@ -466,7 +478,6 @@ externalPlaybackActive:ext];
 }
 
 - (BOOL)canUsePlayerView:(id)playerView forPlayerConfig:(MLInnerTubePlayerConfig *)playerConfig {
-    forceRenderViewTypeBase([playerConfig hamplayerConfig]);
     return %orig;
 }
 
@@ -475,16 +486,20 @@ externalPlaybackActive:ext];
 %hook MLPlayerPool
 
 - (id)acquirePlayerForVideo:(MLVideo *)video playerConfig:(MLInnerTubePlayerConfig *)playerConfig stickySettings:(MLPlayerStickySettings *)stickySettings latencyLogger:(id)latencyLogger reloadContext:(id)reloadContext mediaPlayerResources:(id)mediaPlayerResources recompositeProvider:(id)recompositeProvider {
-    return makeAVPlayer(self, video, playerConfig, stickySettings);
+    YTUHDDump(video, playerConfig);
+    @try {
+        id mcc = [[playerConfig playerConfig] mediaCommonConfig];
+        if ([mcc respondsToSelector:@selector(setUseServerDrivenAbr:)])
+            [mcc setUseServerDrivenAbr:NO];
+    } @catch (...) {}
+    return %orig;
 }
 
 - (id)playerViewForVideo:(MLVideo *)video playerConfig:(MLInnerTubePlayerConfig *)playerConfig mediaPlayerResources:(id)mediaPlayerResources {
-    MLDefaultPlayerViewFactory *factory = [self valueForKey:@"_playerViewFactory"];
-    return [factory AVPlayerViewForVideo:video playerConfig:playerConfig];
+    return %orig;
 }
 
 - (BOOL)canUsePlayerView:(id)playerView forVideo:(MLVideo *)video playerConfig:(MLInnerTubePlayerConfig *)playerConfig {
-    forceRenderViewTypeBase([playerConfig hamplayerConfig]);
     return %orig;
 }
 
@@ -494,51 +509,12 @@ externalPlaybackActive:ext];
 
 %end
 
-%hook MLDefaultPlayerViewFactory
-
-- (id)hamPlayerViewForVideo:(MLVideo *)video playerConfig:(MLInnerTubePlayerConfig *)playerConfig {
-    forceRenderViewType([self valueForKey:@"_hotConfig"]);
-    forceRenderViewTypeBase([playerConfig hamplayerConfig]);
-    return %orig;
-}
-
-- (id)hamPlayerViewForPlayerConfig:(MLInnerTubePlayerConfig *)playerConfig {
-    forceRenderViewType([self valueForKey:@"_hotConfig"]);
-    forceRenderViewTypeBase([playerConfig hamplayerConfig]);
-    return %orig;
-}
-
-- (id)AVPlayerViewForPlayerConfig:(MLInnerTubePlayerConfig *)playerConfig {
-    forceRenderViewType([self valueForKey:@"_hotConfig"]);
-    forceRenderViewTypeBase([playerConfig hamplayerConfig]);
-    return %orig;
-}
-
-- (BOOL)canUsePlayerView:(id)playerView forVideo:(MLVideo *)video playerConfig:(MLInnerTubePlayerConfig *)playerConfig {
-    forceRenderViewTypeBase([playerConfig hamplayerConfig]);
-    return %orig;
-}
-
-- (BOOL)canUsePlayerView:(id)playerView forPlayerConfig:(MLInnerTubePlayerConfig *)playerConfig {
-    forceRenderViewTypeBase([playerConfig hamplayerConfig]);
-    return %orig;
-}
-
-%end
-
-%hook MLVideoDecoderFactory
-
-- (void)prepareDecoderForFormatDescription:(id)formatDescription delegateQueue:(id)delegateQueue {
-    forceRenderViewTypeHot([self valueForKey:@"_hotConfig"]);
-    %orig;
-}
-
-- (void)prepareDecoderForFormatDescription:(id)formatDescription setPixelBufferTypeOnlyIfEmpty:(BOOL)setPixelBufferTypeOnlyIfEmpty delegateQueue:(id)delegateQueue {
-    forceRenderViewTypeHot([self valueForKey:@"_hotConfig"]);
-    %orig;
-}
-
-%end
+// MLDefaultPlayerViewFactory and MLVideoDecoderFactory hooks removed.
+// renderViewType forcing is no longer applied: HAMPlayer runs with the
+// server-sent renderViewType (6 = SBDL_SAMPLE_BUFFER) and handles its own
+// view and decoder setup.  Forcing renderViewType=2 caused the pool to
+// create MLAVPlayer (standalone), which requires hlsManifestUrl — absent
+// from IOS client responses since YouTube migrated to SABR.
 
 // ---------------------------------------------------------------------------
 // SABR bypass — the actual root cause of STREAM_PROTECTION_STATUS=3 Code=14
@@ -560,44 +536,22 @@ externalPlaybackActive:ext];
 // inside the encrypted SABR UMP stream where NSURLProtocol cannot reach it.
 //
 // Fix: returning NO from useServerDrivenAbr causes HAMPlayer to skip the
-// OnesieRequest entirely and fall back to client-side ABR.  Client-side ABR
-// on iOS uses the hlsManifestUrl provided by the /youtubei/v1/player API
-// response.  HLS segment requests to GVS currently do NOT require PO token
-// validation, so the stream plays without any attestation machinery.
+// OnesieRequest entirely and fall back to client-side DASH ABR.  The
+// dropWebM/MLStreamingData hooks strip all WebM (VP9/Opus) formats from the
+// adaptiveStreams list, so the only candidates are H.264 video and AAC audio.
+// Those DASH segment URLs do not appear to carry the same GVS PO-token
+// enforcement that triggered the original itag=251 403.
 //
-// Combined with renderViewType=2 (AVPlayer renderer) the complete stack is:
-//   AVPlayer + HLS manifest → GVS HLS segments → no SABR → no PO token → ✓
+// The complete stack with SABR disabled:
+//   HAMPlayer (SBDL renderer) + client DASH → H.264/AAC segments → no SABR
+//   → no OnesieRequest → no PO token requirement → playback proceeds.
 // ---------------------------------------------------------------------------
 %hook YTIMediaCommonConfig
 - (BOOL)useServerDrivenAbr { return NO; }
 %end
 
-%hook YTGLMediaPlayerViewFactory
-
-- (BOOL)canUsePlayerView:(id)playerView forPlayerConfig:(MLInnerTubePlayerConfig *)playerConfig {
-    forceRenderViewTypeBase([playerConfig hamplayerConfig]);
-    return %orig;
-}
-
-- (id)hamPlayerViewForPlayerConfig:(MLInnerTubePlayerConfig *)playerConfig {
-    forceRenderViewType([self valueForKey:@"_hotConfig"]);
-    forceRenderViewTypeBase([playerConfig hamplayerConfig]);
-    return %orig;
-}
-
-- (id)AVPlayerViewForPlayerConfig:(MLInnerTubePlayerConfig *)playerConfig {
-    forceRenderViewType([self valueForKey:@"_hotConfig"]);
-    forceRenderViewTypeBase([playerConfig hamplayerConfig]);
-    return %orig;
-}
-
-- (id)viewForPlayerConfig:(MLInnerTubePlayerConfig *)playerConfig {
-    forceRenderViewType([self valueForKey:@"_hotConfig"]);
-    forceRenderViewTypeBase([playerConfig hamplayerConfig]);
-    return %orig;
-}
-
-%end
+// YTGLMediaPlayerViewFactory renderViewType hooks removed — no longer forcing
+// renderViewType=2; HAMPlayer selects its own view type based on server config.
 
 // ---------------------------------------------------------------------------
 // WebM/Opus format filter — ABR policy level
@@ -1009,12 +963,22 @@ static NSArray *dropWebM(NSArray *formats) {
 // ---------------------------------------------------------------------------
 %hook YTMainAppVideoPlayerOverlayViewController
 - (void)handleError:(NSError *)error {
-    if (FixPlayback()
-        && [error.domain isEqualToString:@"com.google.ios.youtube.ErrorDomain.playback"]
-        && (error.code == 0   // "Something went wrong" — HAMPlayer DASH 403 (itag=251)
-            || error.code == 2   // "No stream" — AVPlayer found no HLS URL
-            || error.code == 14)) // "Something went wrong" — PO token grace-timer abort
-        return;
+    if (FixPlayback()) {
+        // Always log errors to Documents so we can see what HAMPlayer reports
+        // even when the error UI is suppressed.  Open ytuhd_error_*.txt in FLEX.
+        @try {
+            NSString *docs = NSSearchPathForDirectoriesInDomains(
+                NSDocumentDirectory, NSUserDomainMask, YES)[0];
+            NSString *msg = [NSString stringWithFormat:
+                @"ytuhd_error %@\ndomain=%@  code=%ld\n%@\n",
+                [NSDate date], error.domain, (long)error.code,
+                error.userInfo ?: @{}];
+            NSString *name = [NSString stringWithFormat:@"ytuhd_error_%@.txt",
+                ytuhd_timestamp()];
+            [msg writeToFile:[docs stringByAppendingPathComponent:name]
+                  atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        } @catch (...) {}
+    }
     %orig;
 }
 %end

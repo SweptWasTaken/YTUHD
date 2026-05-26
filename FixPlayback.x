@@ -183,6 +183,31 @@ static void YTUHDDump(MLVideo *video, MLInnerTubePlayerConfig *config) {
         [buf appendString:YTUHDDescribeObject(video,  3)];
         [buf appendString:@"\n=== MLInnerTubePlayerConfig ===\n"];
         [buf appendString:YTUHDDescribeObject(config, 3)];
+
+        // Deep-probe the inner playerConfig proto for client context fields.
+        // The general dump above stops at depth 3; the client context sits
+        // one level deeper (config → playerConfig → context/client → fields).
+        [buf appendString:@"\n=== Client Context Deep Probe ===\n"];
+        @try {
+            id pc = [config valueForKey:@"playerConfig"];
+            if (!pc) pc = [config valueForKey:@"_playerConfig"];
+            [buf appendFormat:@"playerConfig class: %@\n",
+                NSStringFromClass([pc class])];
+            // Candidate key names for the client/context sub-object
+            for (NSString *key in @[@"context", @"clientContext", @"client",
+                                    @"innerTubeContext", @"requestContext",
+                                    @"clientInfo"]) {
+                id ctx = nil;
+                @try { ctx = [pc valueForKey:key]; } @catch (...) { continue; }
+                if (!ctx) continue;
+                [buf appendFormat:@"  .%@ = %@\n", key,
+                    YTUHDDescribeObject(ctx, 2)];
+            }
+            // Also walk all properties on pc one level deeper than normal
+            [buf appendString:@"\n  -- playerConfig full properties (depth 2) --\n"];
+            [buf appendString:YTUHDDescribeObject(pc, 2)];
+        } @catch (...) { [buf appendString:@"  (probe threw)\n"]; }
+
         NSString *docs = NSSearchPathForDirectoriesInDomains(
             NSDocumentDirectory, NSUserDomainMask, YES)[0];
         NSString *name = [NSString stringWithFormat:@"ytuhd_%@.txt", ytuhd_timestamp()];
@@ -1277,4 +1302,59 @@ static NSArray *dropWebM(NSArray *formats) {
 
     sweep(); // synchronous — blocks early iosantiabuse calls at dyld-init time
     dispatch_async(dispatch_get_main_queue(), sweep); // catches GPB classes registered later
+
+    // Diagnostic: 3 s after launch, scan ALL runtime classes for innertubeName
+    // and write results to ytuhd_innertubeclass.txt in Documents.
+    //
+    // Tells us:
+    //   (no classes found) → innertubeName is NOT an ObjC selector; it's a
+    //     string literal in the binary or a Swift-only identifier.  The sweep
+    //     approach is wrong; we need a different hook target.
+    //   class=<X>  retType=@  IMP=<addr> → ObjC method exists and was found.
+    //     If IMP matches our replacement block, the swap stuck.
+    //     If IMP is the original YouTube IMP, it was re-replaced after our sweep.
+    //
+    // Also scans for clientName / clientNameValue in case the client is set
+    // via a proto integer field rather than a string getter.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC),
+                   dispatch_get_main_queue(), ^{
+        NSMutableString *log = [NSMutableString stringWithFormat:
+            @"innertubeName / clientName scan  %@\n\n", [NSDate date]];
+        SEL targets[] = {
+            @selector(innertubeName),
+            @selector(clientVersion),
+            @selector(clientName),
+            @selector(clientNameValue),
+            @selector(innertubeClientName),
+        };
+        const NSUInteger targetCount = sizeof(targets) / sizeof(targets[0]);
+
+        unsigned int classCount = 0;
+        Class *classes = objc_copyClassList(&classCount);
+        for (NSUInteger t = 0; t < targetCount; t++) {
+            NSMutableString *hits = [NSMutableString string];
+            NSUInteger n = 0;
+            for (unsigned int i = 0; i < classCount; i++) {
+                Method m = class_getInstanceMethod(classes[i], targets[t]);
+                if (!m) continue;
+                const char *ret = method_copyReturnType(m);
+                [hits appendFormat:@"    %-60@  retType=%-4s  IMP=%p\n",
+                    NSStringFromClass(classes[i]),
+                    ret ?: "?",
+                    (void *)method_getImplementation(m)];
+                if (ret) free((void *)ret);
+                n++;
+            }
+            [log appendFormat:@"[%@]  %lu class(es)\n",
+                NSStringFromSelector(targets[t]), (unsigned long)n];
+            if (n) [log appendString:hits];
+            [log appendString:@"\n"];
+        }
+        free(classes);
+
+        NSString *docs = NSSearchPathForDirectoriesInDomains(
+            NSDocumentDirectory, NSUserDomainMask, YES)[0];
+        [log writeToFile:[docs stringByAppendingPathComponent:@"ytuhd_innertubeclass.txt"]
+              atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    });
 }

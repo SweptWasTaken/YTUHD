@@ -185,70 +185,131 @@ static void YTUHDDump(MLVideo *video, MLInnerTubePlayerConfig *config) {
 // NSURLSession request here — completely separate from the Cronet-backed
 // InnerTube channel — so the client type is fully under our control.
 //
-// This call blocks the calling thread for up to 8 s.  makeAVPlayer is not
-// dispatched on the main thread by YouTube's player framework (it runs on the
-// HAMPlayer session queue), so the block is safe.  A 30-second NSURLSession
-// configuration timeout is set as a hard backstop.
+// Recent YouTube server-side change: for some accounts the IOS client response
+// now returns serverAbrStreamingUrl (field 15) instead of hlsManifestUrl
+// (field 5).  The same shift may affect WEB_EMBEDDED_PLAYER responses for
+// those accounts.  We therefore try three clients in sequence and take the
+// first one that gives back a hlsManifestUrl.
 //
-// Returns nil on timeout, network error, or absent hlsManifestUrl field.
+// Clients tried (in order):
+//   1. WEB_EMBEDDED_PLAYER (56) — embedded iframe player
+//   2. MWEB (2)                  — mobile web, separate server-side ruleset
+//   3. TVHTML5 (7)               — TV client, always returns HLS (no SABR path)
+//
+// All network I/O runs on a background GCD queue so the calling thread
+// (which may be the main thread) is never blocked for more than 12 s total.
+//
+// A ytuhd_fetch_<ts>.txt file is written to Documents after every attempt
+// so you can open it in FLEX → Files and see exactly what each client
+// returned (HTTP status, hlsManifestUrl, serverAbrStreamingUrl presence).
 // ---------------------------------------------------------------------------
 static NSString *ytuhd_fetchHLSURL(NSString *videoID) {
     if (!videoID.length) return nil;
+
+    // Each entry: clientName, clientVersion, X-Youtube-Client-Name value,
+    //             Origin header, Referer header.
+    NSArray *clients = @[
+        @{ @"name": @"WEB_EMBEDDED_PLAYER", @"version": @"2.20231219.04.00", @"id": @"56",
+           @"origin": @"https://www.youtube.com",
+           @"referer": @"https://www.youtube.com/embed/" },
+        @{ @"name": @"MWEB",                @"version": @"2.20231219.07.00", @"id": @"2",
+           @"origin": @"https://m.youtube.com",
+           @"referer": @"https://m.youtube.com/" },
+        @{ @"name": @"TVHTML5",             @"version": @"7.20240918.01.00", @"id": @"7",
+           @"origin": @"https://www.youtube.com",
+           @"referer": @"https://www.youtube.com/" },
+    ];
 
     NSURL *url = [NSURL URLWithString:
         @"https://www.youtube.com/youtubei/v1/player"
          "?key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8"
          "&prettyPrint=false"];
-    NSMutableURLRequest *req =
-        [NSMutableURLRequest requestWithURL:url
-                                cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
-                            timeoutInterval:8.0];
-    req.HTTPMethod = @"POST";
-    [req setValue:@"application/json"           forHTTPHeaderField:@"Content-Type"];
-    [req setValue:@"56"                         forHTTPHeaderField:@"X-Youtube-Client-Name"];
-    [req setValue:@"2.20231219.04.00"           forHTTPHeaderField:@"X-Youtube-Client-Version"];
-    [req setValue:@"https://www.youtube.com"    forHTTPHeaderField:@"Origin"];
-    [req setValue:@"https://www.youtube.com/embed/" forHTTPHeaderField:@"Referer"];
-
-    NSDictionary *body = @{
-        @"videoId": videoID,
-        @"context": @{
-            @"client": @{
-                @"clientName":    @"WEB_EMBEDDED_PLAYER",
-                @"clientVersion": @"2.20231219.04.00",
-                @"hl":            @"en"
-            }
-        }
-    };
-    req.HTTPBody = [NSJSONSerialization dataWithJSONObject:body options:0 error:nil];
 
     __block NSString *hlsURL = nil;
-    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    NSMutableString *log = [NSMutableString stringWithFormat:
+        @"ytuhd_fetch %@  videoID=%@\n\n", [NSDate date], videoID];
 
-    // Ephemeral config: our NSURLSessionConfiguration.protocolClasses hook will
-    // inject YTUHDAntiAbuseProtocol, but that only intercepts iosantiabuse and
-    // att/get — it will not touch /youtubei/v1/player.
-    NSURLSessionConfiguration *cfg =
-        [NSURLSessionConfiguration ephemeralSessionConfiguration];
-    cfg.timeoutIntervalForRequest  = 8.0;
-    cfg.timeoutIntervalForResource = 30.0;
-    NSURLSession *sess = [NSURLSession sessionWithConfiguration:cfg];
+    // Run all network work on a background queue — safe even if the caller is
+    // the main thread.  We wait on the outer semaphore with a hard 12 s cap.
+    dispatch_semaphore_t outerSem = dispatch_semaphore_create(0);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
 
-    [[sess dataTaskWithRequest:req
-            completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
-        if (!e && d.length) {
-            id json = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
-            if ([json isKindOfClass:[NSDictionary class]]) {
-                id sd = json[@"streamingData"];
-                if ([sd isKindOfClass:[NSDictionary class]])
-                    hlsURL = sd[@"hlsManifestUrl"];
-            }
+        for (NSDictionary *client in clients) {
+            if (hlsURL) break;
+
+            NSMutableURLRequest *req =
+                [NSMutableURLRequest requestWithURL:url
+                                        cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
+                                    timeoutInterval:8.0];
+            req.HTTPMethod = @"POST";
+            [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+            [req setValue:client[@"id"]       forHTTPHeaderField:@"X-Youtube-Client-Name"];
+            [req setValue:client[@"version"]  forHTTPHeaderField:@"X-Youtube-Client-Version"];
+            [req setValue:client[@"origin"]   forHTTPHeaderField:@"Origin"];
+            [req setValue:client[@"referer"]  forHTTPHeaderField:@"Referer"];
+
+            NSDictionary *body = @{
+                @"videoId": videoID,
+                @"context": @{ @"client": @{
+                    @"clientName":    client[@"name"],
+                    @"clientVersion": client[@"version"],
+                    @"hl":            @"en"
+                }}
+            };
+            req.HTTPBody = [NSJSONSerialization dataWithJSONObject:body options:0 error:nil];
+
+            __block NSInteger httpStatus = 0;
+            __block NSString *candidate  = nil;
+            __block BOOL hasSABR         = NO;
+            dispatch_semaphore_t inner = dispatch_semaphore_create(0);
+
+            NSURLSessionConfiguration *cfg =
+                [NSURLSessionConfiguration ephemeralSessionConfiguration];
+            cfg.timeoutIntervalForRequest = 8.0;
+            NSURLSession *sess = [NSURLSession sessionWithConfiguration:cfg];
+
+            [[sess dataTaskWithRequest:req
+                    completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
+                httpStatus = [(NSHTTPURLResponse *)r statusCode];
+                if (!e && d.length) {
+                    id json = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
+                    id sd = [json isKindOfClass:[NSDictionary class]] ? json[@"streamingData"] : nil;
+                    if ([sd isKindOfClass:[NSDictionary class]]) {
+                        candidate = sd[@"hlsManifestUrl"];
+                        hasSABR   = (sd[@"serverAbrStreamingUrl"] != nil);
+                    }
+                }
+                dispatch_semaphore_signal(inner);
+            }] resume];
+
+            dispatch_semaphore_wait(inner, dispatch_time(DISPATCH_TIME_NOW, 8 * NSEC_PER_SEC));
+            [sess finishTasksAndInvalidate];
+
+            [log appendFormat:@"%@  HTTP %ld  hls=%@  sabr=%@\n",
+                client[@"name"], (long)httpStatus,
+                candidate ?: @"(nil)",
+                hasSABR ? @"YES" : @"no"];
+
+            if (candidate.length) hlsURL = candidate;
         }
-        dispatch_semaphore_signal(sem);
-    }] resume];
 
-    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 8 * NSEC_PER_SEC));
-    [sess finishTasksAndInvalidate];
+        dispatch_semaphore_signal(outerSem);
+    });
+
+    dispatch_semaphore_wait(outerSem, dispatch_time(DISPATCH_TIME_NOW, 12 * NSEC_PER_SEC));
+
+    [log appendFormat:@"\nresult: %@\n", hlsURL ?: @"NONE — no client returned hlsManifestUrl"];
+
+    // Write fetch diagnostic to Documents (readable via FLEX Files browser).
+    @try {
+        NSString *docs = NSSearchPathForDirectoriesInDomains(
+            NSDocumentDirectory, NSUserDomainMask, YES)[0];
+        NSString *name = [NSString stringWithFormat:@"ytuhd_fetch_%.0f.txt",
+            [[NSDate date] timeIntervalSince1970]];
+        [log writeToFile:[docs stringByAppendingPathComponent:name]
+              atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    } @catch (...) {}
+
     return hlsURL;
 }
 

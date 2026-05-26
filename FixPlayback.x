@@ -19,14 +19,23 @@
 // responses, fire-and-forget att/get proxying) address symptoms but not
 // the kill path itself.
 //
-// The correct fix is to disable SABR entirely via useServerDrivenAbr=NO
-// on YTIMediaCommonConfig.  HAMPlayer then falls back to client-side ABR
-// using the hlsManifestUrl from the /youtubei/v1/player response.  HLS
-// segment requests to GVS currently do NOT require PO tokens, so playback
-// proceeds without any attestation machinery.
+// DASH approach (tried, confirmed broken): disabling SABR (useServerDrivenAbr=NO)
+// makes HAMPlayer fall back to client-side DASH ABR.  However, ALL DASH stream
+// URLs embed an spc= (Stream Protection Context) parameter that is signed with
+// the PO token at player-request time.  Because the PO token is always empty
+// (AppAttest fails), every spc= is rejected by GVS with 403 — confirmed on:
+//   itag=251 (WebM/Opus audio)   — error log build 1
+//   itag=398 (AV1/MP4 video)     — error log build 2
+//   itag=298 (H.264/MP4 video)   — error log build 3
+// All DASH is dead regardless of codec.
 //
-// Stack after fix: AVPlayer (renderViewType=2) + HLS manifest → GVS HLS
-// segments → no SABR → no STREAM_PROTECTION_STATUS → no Code=14.
+// Fix: intercept the app's authenticated /youtubei/v1/player POST via
+// NSURLProtocol and change clientName from "IOS" to "TVHTML5" in the JSON
+// body.  TVHTML5 responses include hlsManifestUrl (not serverAbrStreamingUrl).
+// HLS segment URLs have no spc= parameter and require no PO token.
+// Combined with renderViewType=2 forcing (creates MLAVPlayer), the stack is:
+//   TVHTML5 /player request → hlsManifestUrl → MLAVPlayer → HLS segments
+//   → no spc= → no PO token needed → playback succeeds.
 
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
@@ -449,16 +458,165 @@ externalPlaybackActive:ext];
     return player;
 }
 
+// ---------------------------------------------------------------------------
+// YTUHDPlayerClientProtocol — swap IOS→TVHTML5 on /youtubei/v1/player POSTs
+//
+// All DASH codecs (WebM/Opus, AV1/MP4, H.264/MP4) are confirmed 403'd.
+// The spc= parameter in every DASH URL is signed with the (always-invalid)
+// PO token at player-request time; GVS rejects it regardless of codec.
+//
+// TVHTML5 responses always include hlsManifestUrl and never use SABR.
+// HLS segment URLs carry no spc= and require no PO token.
+//
+// We intercept the app's own authenticated /player POST (which carries valid
+// auth headers through the Cronet-managed cookie/token store), swap
+// clientName IOS→TVHTML5 in the JSON body, and pipe the TVHTML5 response
+// back.  The iOS proto parser handles it normally, populating
+// MLStreamingData.HLSMasterPlaylistURL.  Combined with renderViewType=2
+// forcing (acquirePlayerForVideo hook below), MLAVPlayer uses the URL.
+//
+// Graceful fallback: if the body is not JSON or has no IOS client context,
+// the request is forwarded unmodified.
+//
+// Diagnostic: a ytuhd_player_<ts>.txt file is written to Documents on every
+// intercept so you can confirm whether the protocol fires at all.
+// ---------------------------------------------------------------------------
+
+static NSURLSession *YTUHDPlayerSession(void) {
+    static NSURLSession *session;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSURLSessionConfiguration *cfg =
+            [NSURLSessionConfiguration defaultSessionConfiguration];
+        session = [NSURLSession sessionWithConfiguration:cfg];
+    });
+    return session;
+}
+
+@interface YTUHDPlayerClientProtocol : NSURLProtocol
+@end
+
+@implementation YTUHDPlayerClientProtocol
+
++ (BOOL)canInitWithRequest:(NSURLRequest *)request {
+    if ([NSURLProtocol propertyForKey:@"YTUHDHandled" inRequest:request])
+        return NO;
+    if (![request.HTTPMethod isEqualToString:@"POST"])
+        return NO;
+    if (![request.URL.path hasSuffix:@"/youtubei/v1/player"])
+        return NO;
+    NSString *host = request.URL.host ?: @"";
+    return [host hasSuffix:@"youtube.com"] || [host hasSuffix:@"googleapis.com"];
+}
+
++ (NSURLRequest *)canonicalRequestForRequest:(NSURLRequest *)request {
+    return request;
+}
+
++ (BOOL)requestIsCacheEquivalent:(NSURLRequest *)a toRequest:(NSURLRequest *)b {
+    return [super requestIsCacheEquivalent:a toRequest:b];
+}
+
+- (void)startLoading {
+    // Read body from HTTPBody or HTTPBodyStream (POST bodies are often streamed)
+    NSData *body = self.request.HTTPBody;
+    if (!body.length) {
+        NSInputStream *stream = self.request.HTTPBodyStream;
+        if (stream) {
+            [stream open];
+            NSMutableData *buf = [NSMutableData dataWithCapacity:8192];
+            uint8_t chunk[4096];
+            NSInteger n;
+            while ((n = [stream read:chunk maxLength:sizeof(chunk)]) > 0)
+                [buf appendBytes:chunk length:(NSUInteger)n];
+            [stream close];
+            body = buf.length ? buf : nil;
+        }
+    }
+
+    NSMutableURLRequest *fwd = [self.request mutableCopy];
+    fwd.HTTPBodyStream = nil;  // clear stream; HTTPBody replaces it below
+    [NSURLProtocol setProperty:@YES forKey:@"YTUHDHandled" inRequest:fwd];
+
+    BOOL modified = NO;
+    if (body.length) {
+        NSError *jsonErr = nil;
+        id obj = [NSJSONSerialization JSONObjectWithData:body
+                                                options:NSJSONReadingMutableContainers
+                                                  error:&jsonErr];
+        if (!jsonErr && [obj isKindOfClass:[NSMutableDictionary class]]) {
+            NSMutableDictionary *root = obj;
+            id ctx = root[@"context"];
+            NSMutableDictionary *c =
+                [ctx isKindOfClass:[NSMutableDictionary class]]
+                    ? [(NSMutableDictionary *)ctx objectForKey:@"client"]
+                    : nil;
+            if ([c isKindOfClass:[NSMutableDictionary class]] &&
+                [c[@"clientName"] isEqualToString:@"IOS"]) {
+                c[@"clientName"]    = @"TVHTML5";
+                c[@"clientVersion"] = @"7.20240918.01.00";
+                // Remove iOS-specific device fields invalid for TV client
+                [c removeObjectForKey:@"deviceMake"];
+                [c removeObjectForKey:@"deviceModel"];
+                [c removeObjectForKey:@"osName"];
+                [c removeObjectForKey:@"osVersion"];
+                [c removeObjectForKey:@"userAgent"];
+                NSData *newBody = [NSJSONSerialization dataWithJSONObject:root
+                                                                  options:0
+                                                                    error:nil];
+                if (newBody) {
+                    fwd.HTTPBody = newBody;
+                    [fwd setValue:[NSString stringWithFormat:@"%lu",
+                                   (unsigned long)newBody.length]
+                 forHTTPHeaderField:@"Content-Length"];
+                    [fwd setValue:@"7"
+                 forHTTPHeaderField:@"X-Youtube-Client-Name"];
+                    [fwd setValue:@"7.20240918.01.00"
+                 forHTTPHeaderField:@"X-Youtube-Client-Version"];
+                    modified = YES;
+                }
+            }
+        }
+        if (!modified) fwd.HTTPBody = body;
+    }
+
+    // Write intercept log to Documents (open ytuhd_player_*.txt in FLEX Files)
+    @try {
+        NSString *docs = NSSearchPathForDirectoriesInDomains(
+            NSDocumentDirectory, NSUserDomainMask, YES)[0];
+        NSString *log = [NSString stringWithFormat:
+            @"ytuhd_player %@\nurl=%@\nmodified=%@\nbody_len=%lu\n",
+            [NSDate date], self.request.URL,
+            modified ? @"YES (IOS→TVHTML5)" : @"NO (not IOS JSON or not matched)",
+            (unsigned long)body.length];
+        [log writeToFile:[docs stringByAppendingPathComponent:
+                [NSString stringWithFormat:@"ytuhd_player_%@.txt", ytuhd_timestamp()]]
+              atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    } @catch (...) {}
+
+    __weak YTUHDPlayerClientProtocol *weakSelf = self;
+    [[YTUHDPlayerSession() dataTaskWithRequest:fwd
+                             completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
+        YTUHDPlayerClientProtocol *s = weakSelf;
+        if (!s) return;
+        if (err) { [s.client URLProtocol:s didFailWithError:err]; return; }
+        [s.client URLProtocol:s
+             didReceiveResponse:resp
+             cacheStoragePolicy:NSURLCacheStorageNotAllowed];
+        if (data.length) [s.client URLProtocol:s didLoadData:data];
+        [s.client URLProtocolDidFinishLoading:s];
+    }] resume];
+}
+
+- (void)stopLoading {}
+
+@end
+
 %hook MLPlayerPoolImpl
 
-// Let HAMPlayer run normally.  SABR is disabled by the YTIMediaCommonConfig
-// hook below; we also write useServerDrivenAbr=NO directly on the proto object
-// here in case HAMPlayer's C++ layer reads it via the C++ proto API (which
-// bypasses ObjC hooks).  With SABR off, HAMPlayer falls back to client-side
-// DASH ABR using the adaptiveStreams list — the dropWebM/MLStreamingData hooks
-// strip out every WebM/Opus format first, so HAMPlayer can only select H.264
-// video and AAC audio tracks, neither of which currently triggers GVS PO-token
-// enforcement for the IOS client.
+// With TVHTML5 /player response: hlsManifestUrl is populated,
+// serverAbrStreamingUrl is absent.  renderViewType=2 makes %orig create
+// MLAVPlayer (not HAMPlayer), which reads hlsManifestUrl directly.
 - (id)acquirePlayerForVideo:(MLVideo *)video playerConfig:(MLInnerTubePlayerConfig *)playerConfig stickySettings:(MLPlayerStickySettings *)stickySettings latencyLogger:(id)latencyLogger reloadContext:(id)reloadContext mediaPlayerResources:(id)mediaPlayerResources recompositeProvider:(id)recompositeProvider {
     YTUHDDump(video, playerConfig);
     @try {
@@ -468,6 +626,12 @@ externalPlaybackActive:ext];
                      : [pc valueForKey:@"mediaCommonConfig"];
         if ([mcc respondsToSelector:@selector(setUseServerDrivenAbr:)])
             [mcc setUseServerDrivenAbr:NO];
+        // Force AVPlayer mode: TVHTML5 response provides hlsManifestUrl.
+        // renderViewType=2 makes the pool create MLAVPlayer (not HAMPlayer),
+        // which uses hlsManifestUrl directly — no DASH / no spc= required.
+        id hc = [pc valueForKey:@"hamplayerConfig"];
+        if ([hc respondsToSelector:@selector(setRenderViewType:)])
+            [hc setRenderViewType:2];
     } @catch (...) {}
     return %orig;
 }
@@ -497,6 +661,12 @@ externalPlaybackActive:ext];
                      : [pc valueForKey:@"mediaCommonConfig"];
         if ([mcc respondsToSelector:@selector(setUseServerDrivenAbr:)])
             [mcc setUseServerDrivenAbr:NO];
+        // Force AVPlayer mode: TVHTML5 response provides hlsManifestUrl.
+        // renderViewType=2 makes the pool create MLAVPlayer (not HAMPlayer),
+        // which uses hlsManifestUrl directly — no DASH / no spc= required.
+        id hc = [pc valueForKey:@"hamplayerConfig"];
+        if ([hc respondsToSelector:@selector(setRenderViewType:)])
+            [hc setRenderViewType:2];
     } @catch (...) {}
     return %orig;
 }
@@ -568,18 +738,19 @@ externalPlaybackActive:ext];
 // WebM/Opus audio (itag=251) segments for the IOS client.  Native iOS
 // codecs (H.264 video, AAC audio) currently do not trigger enforcement.
 //
-// GVS PO-token enforcement is confirmed on:
-//   itag=251 (WebM/Opus audio)   — original error, error log build 1
-//   itag=398 (AV1/MP4 video)     — new error, error log build 2
+// GVS PO-token enforcement confirmed on ALL DASH regardless of codec:
+//   itag=251 (WebM/Opus audio)   — error log build 1
+//   itag=398 (AV1/MP4 video)     — error log build 2
+//   itag=298 (H.264/MP4 video)   — error log build 3
 //
-// AV1 streams use mime=video/mp4, identical to H.264, so the original
-// WebM MIME check missed them entirely.  HAMPlayer selects AV1 first
-// (best compression) → 403 → gives up without trying H.264.
+// The spc= parameter is embedded in EVERY DASH URL at player-request time
+// and signed with the PO token.  Since the token is always empty, spc= is
+// globally invalid and GVS rejects every DASH segment with 403.  These
+// ABR policy + MLStreamingData hooks are now belt-and-suspenders only; the
+// primary fix is the TVHTML5 client spoof which avoids DASH entirely.
 //
-// Fix: extend the filter to also drop AV1 itags 394–399.  H.264 video
-// (134–137, 160, 133, 298, 299) and AAC audio (139–141) have not been
-// observed to 403, suggesting enforcement is codec-selective rather than
-// universal across all DASH streams.
+// AV1 streams use mime=video/mp4 (same as H.264) so the original WebM MIME
+// check missed them — the itag 394–399 filter handles that case.
 //
 // Note: Tweak.xm's equivalent hooks are skipped when FixPlayback()=YES
 // (see Tweak.xm %ctor guard), so these hooks must live here.
@@ -868,8 +1039,11 @@ static NSArray *dropWebM(NSArray *formats) {
 %hook NSURLSessionConfiguration
 - (NSArray *)protocolClasses {
     NSMutableArray *classes = [[NSMutableArray alloc] initWithArray:(%orig ?: @[])];
-    Class antiAbuse = [YTUHDAntiAbuseProtocol class];
-    if (![classes containsObject:antiAbuse]) [classes insertObject:antiAbuse atIndex:0];
+    Class antiAbuse    = [YTUHDAntiAbuseProtocol    class];
+    Class playerClient = [YTUHDPlayerClientProtocol class];
+    // Insert player-client first so it runs before the anti-abuse handler.
+    if (![classes containsObject:playerClient]) [classes insertObject:playerClient atIndex:0];
+    if (![classes containsObject:antiAbuse])    [classes insertObject:antiAbuse    atIndex:0];
     return classes;
 }
 %end
@@ -1018,6 +1192,7 @@ static NSArray *dropWebM(NSArray *formats) {
     %init;
     // Belt-and-suspenders registration for NSURLConnection and any session
     // using the default URL loading system (complements the configuration hook).
+    [NSURLProtocol registerClass:[YTUHDPlayerClientProtocol class]];
     [NSURLProtocol registerClass:[YTUHDAntiAbuseProtocol class]];
 
     // Runtime enumeration: replace hasPoToken and isIosguardAttestationEnabled

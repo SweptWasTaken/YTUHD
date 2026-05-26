@@ -1243,20 +1243,22 @@ static NSArray *dropWebM(NSArray *formats) {
     IMP yesIMP = imp_implementationWithBlock(^BOOL(__unused id _self) { return YES; });
     IMP noIMP  = imp_implementationWithBlock(^BOOL(__unused id _self) { return NO;  });
 
-    // innertubeName — the string getter the app calls when building the
-    // InnerTube client context that Cronet serialises into /player requests.
-    // The same value ends up as c=IOS in GVS segment URLs.  Replacing it
-    // with "TVHTML5" makes every /player response include hlsManifestUrl
-    // instead of serverAbrStreamingUrl; HLS segment URLs carry no spc=
-    // parameter and require no PO token.
+    // Runtime scan result: innertubeName is NOT an ObjC selector in YouTube
+    // (only matched UIKit/Reminders system classes — completely wrong target).
     //
-    // We co-replace clientVersion on the same class to avoid a client-name /
-    // version mismatch being rejected by YouTube's InnerTube validation.
-    SEL inTubeNameSel    = @selector(innertubeName);
+    // Actual target: YTIClientInfo.clientName — a proto-generated int32_t
+    // getter confirmed by the 3-second diagnostic scan:
+    //   YTIClientInfo  clientName    retType=i  IMP=0x102f20e28
+    //   YTIClientInfo  clientVersion retType=@  IMP=0x11660d0d0
+    //
+    // InnerTube client enum: IOS=5, TVHTML5=7.  141 iOS system classes
+    // (Photos, AVCapture, HomeKit…) also have clientName — the YTI prefix
+    // filter ensures we only touch YouTube InnerTube proto classes.
+    SEL clientNameSel    = @selector(clientName);
     SEL clientVersionSel = @selector(clientVersion);
 
-    IMP tvNameIMP = imp_implementationWithBlock(
-        ^NSString *(__unused id _self) { return @"TVHTML5"; });
+    IMP tvClientNameIntIMP = imp_implementationWithBlock(
+        ^int32_t(__unused id _self) { return 7; }); // 7 = TVHTML5
     IMP tvVersionIMP = imp_implementationWithBlock(
         ^NSString *(__unused id _self) { return @"7.20240918.01.00"; });
 
@@ -1274,16 +1276,19 @@ static NSArray *dropWebM(NSArray *formats) {
                     class_replaceMethod(cls, hasPoTokenSel, yesIMP, "B@:");
                 else if (sel == isIosguardEnabledSel)
                     class_replaceMethod(cls, isIosguardEnabledSel, noIMP, "B@:");
-                else if (sel == inTubeNameSel) {
-                    // Only replace string-returning methods (not int/BOOL variants)
+                else if (sel == clientNameSel) {
+                    // Only target integer clientName on YTI-prefixed classes.
+                    // iOS has 141 classes with clientName (Photos, AVCapture,
+                    // HomeKit…); the retType=i + YTI prefix check filters to
+                    // YouTube InnerTube proto classes only.
                     const char *ret = method_copyReturnType(methods[j]);
-                    BOOL isStr = ret && ret[0] == '@';
+                    BOOL isInt = ret && (ret[0] == 'i' || ret[0] == 'I');
                     if (ret) free((void *)ret);
-                    if (!isStr) continue;
-                    class_replaceMethod(cls, inTubeNameSel, tvNameIMP,
+                    if (!isInt) continue;
+                    if (![NSStringFromClass(cls) hasPrefix:@"YTI"]) continue;
+                    class_replaceMethod(cls, clientNameSel, tvClientNameIntIMP,
                                         method_getTypeEncoding(methods[j]));
-                    // Co-replace clientVersion on the same class so the
-                    // name/version pair is consistent for TVHTML5.
+                    // Co-replace clientVersion (string) on the same class
                     Method vm = class_getInstanceMethod(cls, clientVersionSel);
                     if (vm) {
                         const char *vret = method_copyReturnType(vm);
@@ -1302,6 +1307,8 @@ static NSArray *dropWebM(NSArray *formats) {
 
     sweep(); // synchronous — blocks early iosantiabuse calls at dyld-init time
     dispatch_async(dispatch_get_main_queue(), sweep); // catches GPB classes registered later
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC),
+                   dispatch_get_main_queue(), sweep); // belt-and-suspenders for late GPB init
 
     // Diagnostic: 3 s after launch, scan ALL runtime classes for innertubeName
     // and write results to ytuhd_innertubeclass.txt in Documents.

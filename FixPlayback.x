@@ -156,6 +156,13 @@ static NSString *YTUHDDescribeValue(id val, int depth) {
     return [val description];
 }
 
+static NSString *ytuhd_timestamp(void) {
+    NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
+    fmt.dateFormat = @"yyyy-MM-dd_HH-mm-ss";
+    fmt.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+    return [fmt stringFromDate:[NSDate date]];
+}
+
 static void YTUHDDump(MLVideo *video, MLInnerTubePlayerConfig *config) {
     @try {
         NSMutableString *buf = [NSMutableString string];
@@ -166,8 +173,7 @@ static void YTUHDDump(MLVideo *video, MLInnerTubePlayerConfig *config) {
         [buf appendString:YTUHDDescribeObject(config, 3)];
         NSString *docs = NSSearchPathForDirectoriesInDomains(
             NSDocumentDirectory, NSUserDomainMask, YES)[0];
-        NSString *name = [NSString stringWithFormat:@"ytuhd_%.0f.txt",
-            [[NSDate date] timeIntervalSince1970]];
+        NSString *name = [NSString stringWithFormat:@"ytuhd_%@.txt", ytuhd_timestamp()];
         [buf writeToFile:[docs stringByAppendingPathComponent:name]
               atomically:YES encoding:NSUTF8StringEncoding error:nil];
     } @catch (...) { /* never crash the player */ }
@@ -304,8 +310,7 @@ static NSString *ytuhd_fetchHLSURL(NSString *videoID) {
     @try {
         NSString *docs = NSSearchPathForDirectoriesInDomains(
             NSDocumentDirectory, NSUserDomainMask, YES)[0];
-        NSString *name = [NSString stringWithFormat:@"ytuhd_fetch_%.0f.txt",
-            [[NSDate date] timeIntervalSince1970]];
+        NSString *name = [NSString stringWithFormat:@"ytuhd_fetch_%@.txt", ytuhd_timestamp()];
         [log writeToFile:[docs stringByAppendingPathComponent:name]
               atomically:YES encoding:NSUTF8StringEncoding error:nil];
     } @catch (...) {}

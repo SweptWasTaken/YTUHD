@@ -462,7 +462,10 @@ externalPlaybackActive:ext];
 - (id)acquirePlayerForVideo:(MLVideo *)video playerConfig:(MLInnerTubePlayerConfig *)playerConfig stickySettings:(MLPlayerStickySettings *)stickySettings latencyLogger:(id)latencyLogger reloadContext:(id)reloadContext mediaPlayerResources:(id)mediaPlayerResources recompositeProvider:(id)recompositeProvider {
     YTUHDDump(video, playerConfig);
     @try {
-        id mcc = [[playerConfig playerConfig] mediaCommonConfig];
+        id pc  = [playerConfig valueForKey:@"playerConfig"];
+        id mcc = [pc respondsToSelector:@selector(mediaCommonConfig)]
+                     ? [pc mediaCommonConfig]
+                     : [pc valueForKey:@"mediaCommonConfig"];
         if ([mcc respondsToSelector:@selector(setUseServerDrivenAbr:)])
             [mcc setUseServerDrivenAbr:NO];
     } @catch (...) {}
@@ -488,7 +491,10 @@ externalPlaybackActive:ext];
 - (id)acquirePlayerForVideo:(MLVideo *)video playerConfig:(MLInnerTubePlayerConfig *)playerConfig stickySettings:(MLPlayerStickySettings *)stickySettings latencyLogger:(id)latencyLogger reloadContext:(id)reloadContext mediaPlayerResources:(id)mediaPlayerResources recompositeProvider:(id)recompositeProvider {
     YTUHDDump(video, playerConfig);
     @try {
-        id mcc = [[playerConfig playerConfig] mediaCommonConfig];
+        id pc  = [playerConfig valueForKey:@"playerConfig"];
+        id mcc = [pc respondsToSelector:@selector(mediaCommonConfig)]
+                     ? [pc mediaCommonConfig]
+                     : [pc valueForKey:@"mediaCommonConfig"];
         if ([mcc respondsToSelector:@selector(setUseServerDrivenAbr:)])
             [mcc setUseServerDrivenAbr:NO];
     } @catch (...) {}

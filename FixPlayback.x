@@ -568,12 +568,18 @@ externalPlaybackActive:ext];
 // WebM/Opus audio (itag=251) segments for the IOS client.  Native iOS
 // codecs (H.264 video, AAC audio) currently do not trigger enforcement.
 //
-// The stream filter in forceRenderViewTypeBase zeroes VP9/AV1 max area,
-// which prevents HAMPlayer from ever proposing those formats.  These ABR
-// policy hooks are belt-and-suspenders: they run AFTER format list
-// assembly and strip any remaining WebM format before the ABR algorithm
-// makes a selection.  The check is purely on the URL's MIME query param —
-// no enum magic required.
+// GVS PO-token enforcement is confirmed on:
+//   itag=251 (WebM/Opus audio)   — original error, error log build 1
+//   itag=398 (AV1/MP4 video)     — new error, error log build 2
+//
+// AV1 streams use mime=video/mp4, identical to H.264, so the original
+// WebM MIME check missed them entirely.  HAMPlayer selects AV1 first
+// (best compression) → 403 → gives up without trying H.264.
+//
+// Fix: extend the filter to also drop AV1 itags 394–399.  H.264 video
+// (134–137, 160, 133, 298, 299) and AAC audio (139–141) have not been
+// observed to 403, suggesting enforcement is codec-selective rather than
+// universal across all DASH streams.
 //
 // Note: Tweak.xm's equivalent hooks are skipped when FixPlayback()=YES
 // (see Tweak.xm %ctor guard), so these hooks must live here.
@@ -586,21 +592,39 @@ static NSArray *dropWebM(NSArray *formats) {
                 if (![fmt isKindOfClass:%c(MLFormat)]) return YES;
                 NSString *urlStr = [[fmt URL] absoluteString];
                 if (!urlStr) return YES;
-                // MIME type appears in the URL as mime=audio/webm or
-                // mime=video/webm (slash is typically unencoded in query params).
+
+                // ── WebM (VP9 video + Opus audio) ─────────────────────────
+                // MIME type in the URL: mime=audio/webm or mime=video/webm.
                 if ([urlStr rangeOfString:@"mime=audio/webm"
                                  options:NSCaseInsensitiveSearch].location != NSNotFound)
                     return NO;
                 if ([urlStr rangeOfString:@"mime=video/webm"
                                  options:NSCaseInsensitiveSearch].location != NSNotFound)
                     return NO;
-                // Percent-encoded variants (belt-and-suspenders).
+                // Percent-encoded variants.
                 if ([urlStr rangeOfString:@"mime=audio%2Fwebm"
                                  options:NSCaseInsensitiveSearch].location != NSNotFound)
                     return NO;
                 if ([urlStr rangeOfString:@"mime=video%2Fwebm"
                                  options:NSCaseInsensitiveSearch].location != NSNotFound)
                     return NO;
+
+                // ── AV1 in MP4 container (itag 394–399) ───────────────────
+                // AV1 uses mime=video/mp4 (same as H.264), so the MIME check
+                // above doesn't catch it.  Match the itag parameter directly.
+                // The pattern ensures we match the full token, not a prefix
+                // (e.g. &itag=394& or &itag=394 at end-of-string).
+                for (NSString *tag in @[@"itag=394", @"itag=395", @"itag=396",
+                                        @"itag=397", @"itag=398", @"itag=399"]) {
+                    NSRange r = [urlStr rangeOfString:tag
+                                             options:NSCaseInsensitiveSearch];
+                    if (r.location == NSNotFound) continue;
+                    // Confirm the character after the tag is '&', '?', or end.
+                    NSUInteger end = NSMaxRange(r);
+                    if (end >= urlStr.length || [urlStr characterAtIndex:end] == '&')
+                        return NO;
+                }
+
                 return YES;
             }]];
 }

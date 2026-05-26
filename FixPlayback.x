@@ -1218,6 +1218,23 @@ static NSArray *dropWebM(NSArray *formats) {
     IMP yesIMP = imp_implementationWithBlock(^BOOL(__unused id _self) { return YES; });
     IMP noIMP  = imp_implementationWithBlock(^BOOL(__unused id _self) { return NO;  });
 
+    // innertubeName — the string getter the app calls when building the
+    // InnerTube client context that Cronet serialises into /player requests.
+    // The same value ends up as c=IOS in GVS segment URLs.  Replacing it
+    // with "TVHTML5" makes every /player response include hlsManifestUrl
+    // instead of serverAbrStreamingUrl; HLS segment URLs carry no spc=
+    // parameter and require no PO token.
+    //
+    // We co-replace clientVersion on the same class to avoid a client-name /
+    // version mismatch being rejected by YouTube's InnerTube validation.
+    SEL inTubeNameSel    = @selector(innertubeName);
+    SEL clientVersionSel = @selector(clientVersion);
+
+    IMP tvNameIMP = imp_implementationWithBlock(
+        ^NSString *(__unused id _self) { return @"TVHTML5"; });
+    IMP tvVersionIMP = imp_implementationWithBlock(
+        ^NSString *(__unused id _self) { return @"7.20240918.01.00"; });
+
     void (^sweep)(void) = ^{
         unsigned int classCount = 0;
         Class *classes = objc_copyClassList(&classCount);
@@ -1232,6 +1249,26 @@ static NSArray *dropWebM(NSArray *formats) {
                     class_replaceMethod(cls, hasPoTokenSel, yesIMP, "B@:");
                 else if (sel == isIosguardEnabledSel)
                     class_replaceMethod(cls, isIosguardEnabledSel, noIMP, "B@:");
+                else if (sel == inTubeNameSel) {
+                    // Only replace string-returning methods (not int/BOOL variants)
+                    const char *ret = method_copyReturnType(methods[j]);
+                    BOOL isStr = ret && ret[0] == '@';
+                    if (ret) free((void *)ret);
+                    if (!isStr) continue;
+                    class_replaceMethod(cls, inTubeNameSel, tvNameIMP,
+                                        method_getTypeEncoding(methods[j]));
+                    // Co-replace clientVersion on the same class so the
+                    // name/version pair is consistent for TVHTML5.
+                    Method vm = class_getInstanceMethod(cls, clientVersionSel);
+                    if (vm) {
+                        const char *vret = method_copyReturnType(vm);
+                        BOOL vIsStr = vret && vret[0] == '@';
+                        if (vret) free((void *)vret);
+                        if (vIsStr)
+                            class_replaceMethod(cls, clientVersionSel, tvVersionIMP,
+                                                method_getTypeEncoding(vm));
+                    }
+                }
             }
             free(methods);
         }

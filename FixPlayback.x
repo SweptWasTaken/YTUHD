@@ -11,31 +11,30 @@
 //   Code=14 "Something went wrong".
 //
 //   ALL DASH codecs are 403'd because every DASH URL embeds spc= (Stream
-//   Protection Context) signed with the empty PO token at player-request time:
-//     itag=251 (WebM/Opus audio)  — error log build 1
-//     itag=398 (AV1/MP4 video)   — error log build 2
-//     itag=298 (H.264/MP4 video) — error log build 3
+//   Protection Context) signed with the empty PO token at player-request time.
 //
 // Fix: spoof the InnerTube client to ANDROID_VR (Oculus Quest, client ID 28).
 //
-//   ANDROID_VR returns standard DASH adaptive streams that are currently exempt
-//   from PO token enforcement on GVS — no spc= validation occurs.  HAMPlayer
-//   handles DASH natively so renderViewType stays at the server default; no
-//   AVPlayer or HLS injection is needed.
+//   ANDROID_VR DASH streams are currently exempt from PO token enforcement on
+//   GVS.  HAMPlayer handles DASH natively; no AVPlayer or HLS injection is
+//   needed.
 //
-//   The client swap is applied at two layers:
-//     1. ObjC runtime sweep — replaces YTIClientInfo.clientName (int32 proto
-//        getter, IOS=5 → ANDROID_VR=28) on every class that implements it.
-//        This travels with ALL requests including Cronet-backed ones.
-//     2. YTUHDPlayerClientProtocol (NSURLProtocol) — rewrites /player POST
-//        body for any request that goes through NSURLSession (belt-and-suspenders;
-//        Cronet-backed calls are already handled by the sweep above).
+//   The client swap is applied at three layers:
+//     1. NSMutableURLRequest setHTTPBody: hook — deserializes the JSON body for
+//        /player, /next, and /browse requests, rewrites context.client to
+//        ANDROID_VR, and re-serializes.  This fires at the ObjC layer before
+//        the body is handed to Cronet, so ALL requests are covered regardless
+//        of which HTTP stack (Cronet, NSURLSession) carries them.  Also
+//        persists visitorData across sessions for consistency, and captures
+//        the OAuth Bearer token for PO token substitution.
+//     2. NSMutableURLRequest setValue:forHTTPHeaderField: hook — rewrites
+//        X-YouTube-Client-Name/Version headers and captures Authorization.
+//     3. ObjC runtime sweep — replaces YTIClientInfo.clientName (int32 proto
+//        getter, IOS=5 → ANDROID_VR=28) on all YTI-prefixed classes.  Belt-
+//        and-suspenders for any code path that reads the proto object directly.
 //
-//   SABR is disabled (useServerDrivenAbr=NO) to prevent OnesieRequests entirely,
-//   since ANDROID_VR responses may still include serverAbrStreamingUrl.
-//
-//   Anti-abuse and att/get intercepts remain active to prevent the AppAttest
-//   400 from reaching C++ and arming the SABR kill timer.
+//   SABR is disabled (useServerDrivenAbr=NO) to prevent OnesieRequests entirely.
+//   Anti-abuse and att/get intercepts remain active.
 
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
@@ -65,10 +64,64 @@ extern BOOL FixPlayback();
 @end
 
 // ---------------------------------------------------------------------------
+// Session state — visitorData and OAuth token persistence
+//
+// visitorData: extracted from every outgoing InnerTube request body and stored
+// in NSUserDefaults.  Reinjected into subsequent requests so the server sees
+// a consistent ANDROID_VR session identity across video navigations.
+//
+// oauthToken: the raw Bearer token extracted from Authorization headers.
+// Returned by IGDPOTokenMinter as a substitute PO token — prevents the "no
+// token" SABR grace timer from firing if ANDROID_VR ever receives SABR.
+// ---------------------------------------------------------------------------
+
+static NSString *YTUHDGetVisitorData(void) {
+    return [[NSUserDefaults standardUserDefaults] stringForKey:@"ytuhd_visitorData"] ?: @"";
+}
+
+static void YTUHDSetVisitorData(NSString *vd) {
+    if (vd.length)
+        [[NSUserDefaults standardUserDefaults] setObject:vd forKey:@"ytuhd_visitorData"];
+}
+
+static NSData *YTUHDGetOAuthTokenData(void) {
+    NSString *t = [[NSUserDefaults standardUserDefaults] stringForKey:@"ytuhd_oauth"];
+    return t.length ? [t dataUsingEncoding:NSUTF8StringEncoding] : [NSData data];
+}
+
+static void YTUHDSetOAuthToken(NSString *token) {
+    if (token.length)
+        [[NSUserDefaults standardUserDefaults] setObject:token forKey:@"ytuhd_oauth"];
+}
+
+static BOOL YTUHDIsPlayerPath(NSString *path) {
+    return [path containsString:@"/player"]
+        || [path containsString:@"/next"]
+        || [path containsString:@"/browse"];
+}
+
+// Returns an ANDROID_VR client dictionary using the best available visitorData.
+static NSDictionary *YTUHDClientContext(NSString *visitorData) {
+    NSMutableDictionary *c = [NSMutableDictionary dictionaryWithDictionary:@{
+        @"clientName":        @"ANDROID_VR",
+        @"clientVersion":     @"1.65.10",
+        @"deviceMake":        @"Oculus",
+        @"deviceModel":       @"Quest 3",
+        @"androidSdkVersion": @32,
+        @"osName":            @"Android",
+        @"osVersion":         @"12L",
+        @"hl":                @"en",
+        @"gl":                @"US",
+    }];
+    NSString *vd = visitorData.length ? visitorData : YTUHDGetVisitorData();
+    if (vd.length) c[@"visitorData"] = vd;
+    return [c copy];
+}
+
+// ---------------------------------------------------------------------------
 // Runtime diagnostic dump
 //
-// Written to Documents/ytuhd_<timestamp>.txt on every acquirePlayerForVideo
-// call.  Open in Files app or any file manager to inspect the player config.
+// Written to Documents/ytuhd_<timestamp>.txt on every acquirePlayerForVideo.
 // ---------------------------------------------------------------------------
 
 static NSString *YTUHDDescribeValue(id val, int depth);
@@ -168,18 +221,115 @@ static void YTUHDDump(MLVideo *video, MLInnerTubePlayerConfig *config) {
 }
 
 // ---------------------------------------------------------------------------
-// YTUHDPlayerClientProtocol — swap IOS → ANDROID_VR on /youtubei/v1/player
+// NSMutableURLRequest — JSON body interception (Layer 1, primary fix)
 //
-// Belt-and-suspenders for /player POSTs that go through NSURLSession (not
-// Cronet).  The ObjC runtime sweep in %ctor handles Cronet-backed calls by
-// replacing YTIClientInfo.clientName at the proto layer; this protocol catches
-// any remaining NSURLSession code paths.
+// Hooks setHTTPBody: because:
+//   a) It fires AFTER the URL is set (so self.URL.path is available for
+//      filtering) and BEFORE the request is handed to Cronet.
+//   b) Cronet reads the request body from the NSMutableURLRequest object when
+//      dataTaskWithRequest: is called — so our modification is what Cronet
+//      actually sends.
 //
-// If the request body contains clientName="IOS" the body is rewritten to
-// ANDROID_VR with the correct version and device fields.  Requests whose body
-// is not IOS JSON are forwarded unmodified.
+// For /player, /next, and /browse paths:
+//   1. Deserializes the JSON body into a mutable NSDictionary.
+//   2. Extracts and persists any visitorData present in the outgoing context
+//      (it comes from YouTube's own session manager and is valid for ANDROID_VR).
+//   3. Replaces context.client entirely with the ANDROID_VR client dictionary,
+//      injecting the persisted visitorData.
+//   4. Re-serializes and passes the modified body to the original setter.
+//   5. Sets matching X-YouTube-Client-Name/Version and User-Agent headers.
 //
-// A ytuhd_player_<ts>.txt file is written to Documents on every intercept.
+// setValue:forHTTPHeaderField: additionally captures the OAuth Bearer token
+// and rewrites X-YouTube-Client-Name/Version when YouTube sets them.
+// ---------------------------------------------------------------------------
+
+%hook NSMutableURLRequest
+
+- (void)setHTTPBody:(NSData *)body {
+    NSString *path = self.URL.path;
+    if (!body.length || !YTUHDIsPlayerPath(path)) {
+        %orig;
+        return;
+    }
+
+    id obj = [NSJSONSerialization JSONObjectWithData:body
+                                            options:NSJSONReadingMutableContainers
+                                              error:nil];
+    if (![obj isKindOfClass:[NSMutableDictionary class]]) {
+        %orig;
+        return;
+    }
+
+    NSMutableDictionary *root = (NSMutableDictionary *)obj;
+
+    // Extract visitorData from the outgoing context before we overwrite it.
+    // YouTube's session manager populates this; it remains valid server-side
+    // even when we change the client type.
+    NSString *extractedVD = nil;
+    id existingCtx = root[@"context"];
+    if ([existingCtx isKindOfClass:[NSDictionary class]]) {
+        id existingClient = [(NSDictionary *)existingCtx objectForKey:@"client"];
+        if ([existingClient isKindOfClass:[NSDictionary class]])
+            extractedVD = existingClient[@"visitorData"];
+    }
+    if (extractedVD.length) YTUHDSetVisitorData(extractedVD);
+
+    // Build or update the context dict with our ANDROID_VR client.
+    NSMutableDictionary *ctx;
+    if ([existingCtx isKindOfClass:[NSMutableDictionary class]])
+        ctx = (NSMutableDictionary *)existingCtx;
+    else
+        ctx = [NSMutableDictionary dictionary];
+
+    ctx[@"client"] = YTUHDClientContext(extractedVD);
+    root[@"context"] = ctx;
+
+    NSData *newBody = [NSJSONSerialization dataWithJSONObject:root options:0 error:nil];
+    if (!newBody) { %orig; return; }
+
+    %orig(newBody);
+
+    // Set matching identity headers.  Using the internal setter avoids
+    // re-entering our hook for these specific key names.
+    [self setValue:@"28"        forHTTPHeaderField:@"X-Youtube-Client-Name"];
+    [self setValue:@"1.65.10"   forHTTPHeaderField:@"X-Youtube-Client-Version"];
+    [self setValue:@"com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip"
+          forHTTPHeaderField:@"User-Agent"];
+    [self setValue:[NSString stringWithFormat:@"%lu", (unsigned long)newBody.length]
+          forHTTPHeaderField:@"Content-Length"];
+}
+
+- (void)setValue:(NSString *)value forHTTPHeaderField:(NSString *)field {
+    // Capture OAuth token for PO token substitution.
+    if ([field caseInsensitiveCompare:@"Authorization"] == NSOrderedSame
+        && [value hasPrefix:@"Bearer "]) {
+        YTUHDSetOAuthToken([value substringFromIndex:7]);
+    }
+
+    // Override client name/version headers on InnerTube paths.
+    if (YTUHDIsPlayerPath(self.URL.path)) {
+        if ([field caseInsensitiveCompare:@"X-YouTube-Client-Name"] == NSOrderedSame) {
+            %orig(@"28", field);
+            return;
+        }
+        if ([field caseInsensitiveCompare:@"X-YouTube-Client-Version"] == NSOrderedSame) {
+            %orig(@"1.65.10", field);
+            return;
+        }
+    }
+
+    %orig;
+}
+
+%end
+
+// ---------------------------------------------------------------------------
+// YTUHDPlayerClientProtocol — /player body rewrite for NSURLSession paths
+//
+// Belt-and-suspenders for any /player POST that goes through NSURLSession
+// rather than Cronet.  The setHTTPBody: hook above handles Cronet.  Both can
+// coexist: if setHTTPBody: already rewrote the body to ANDROID_VR, the
+// clientName check below finds "ANDROID_VR" (not "IOS") and passes through.
 // ---------------------------------------------------------------------------
 
 static NSURLSession *YTUHDPlayerSession(void) {
@@ -240,30 +390,24 @@ static NSURLSession *YTUHDPlayerSession(void) {
                                                   error:nil];
         if ([obj isKindOfClass:[NSMutableDictionary class]]) {
             NSMutableDictionary *root = obj;
+            id ctx = root[@"context"];
             NSMutableDictionary *c =
-                [root[@"context"] isKindOfClass:[NSMutableDictionary class]]
-                    ? [(NSMutableDictionary *)root[@"context"] objectForKey:@"client"]
-                    : nil;
+                [ctx isKindOfClass:[NSMutableDictionary class]]
+                    ? [(NSMutableDictionary *)ctx objectForKey:@"client"] : nil;
+            // Only rewrite if still IOS — setHTTPBody: may have already done it.
             if ([c isKindOfClass:[NSMutableDictionary class]] &&
                 [c[@"clientName"] isEqualToString:@"IOS"]) {
-                c[@"clientName"]         = @"ANDROID_VR";
-                c[@"clientVersion"]      = @"1.65.10";
-                c[@"deviceMake"]         = @"Oculus";
-                c[@"deviceModel"]        = @"Quest 3";
-                c[@"androidSdkVersion"]  = @32;
-                c[@"osName"]             = @"Android";
-                c[@"osVersion"]          = @"12L";
-                [c removeObjectForKey:@"userAgent"];
+                NSString *vd = c[@"visitorData"];
+                if (vd.length) YTUHDSetVisitorData(vd);
+                [(NSMutableDictionary *)ctx setObject:YTUHDClientContext(vd) forKey:@"client"];
                 NSData *newBody = [NSJSONSerialization dataWithJSONObject:root options:0 error:nil];
                 if (newBody) {
                     fwd.HTTPBody = newBody;
                     [fwd setValue:[NSString stringWithFormat:@"%lu",
                                    (unsigned long)newBody.length]
                  forHTTPHeaderField:@"Content-Length"];
-                    [fwd setValue:@"28"        forHTTPHeaderField:@"X-Youtube-Client-Name"];
-                    [fwd setValue:@"1.65.10"   forHTTPHeaderField:@"X-Youtube-Client-Version"];
-                    [fwd setValue:@"com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip"
-                 forHTTPHeaderField:@"User-Agent"];
+                    [fwd setValue:@"28"      forHTTPHeaderField:@"X-Youtube-Client-Name"];
+                    [fwd setValue:@"1.65.10" forHTTPHeaderField:@"X-Youtube-Client-Version"];
                     modified = YES;
                 }
             }
@@ -273,14 +417,13 @@ static NSURLSession *YTUHDPlayerSession(void) {
 
     @try {
         NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES)[0];
-        NSString *log = [NSString stringWithFormat:
-            @"ytuhd_player %@\nurl=%@\nmodified=%@\nbody_len=%lu\n",
+        [[NSString stringWithFormat:@"ytuhd_player %@\nurl=%@\nmodified=%@\nbody_len=%lu\n",
             [NSDate date], self.request.URL,
             modified ? @"YES (IOS→ANDROID_VR)" : @"NO",
-            (unsigned long)body.length];
-        [log writeToFile:[docs stringByAppendingPathComponent:
+            (unsigned long)body.length]
+         writeToFile:[docs stringByAppendingPathComponent:
                 [NSString stringWithFormat:@"ytuhd_player_%@.txt", ytuhd_timestamp()]]
-              atomically:YES encoding:NSUTF8StringEncoding error:nil];
+          atomically:YES encoding:NSUTF8StringEncoding error:nil];
     } @catch (...) {}
 
     __weak YTUHDPlayerClientProtocol *weakSelf = self;
@@ -301,15 +444,11 @@ static NSURLSession *YTUHDPlayerSession(void) {
 @end
 
 // ---------------------------------------------------------------------------
-// Player pool hooks
+// Player pool hooks — disable SABR
 //
-// SABR is disabled via useServerDrivenAbr=NO to prevent OnesieRequests, which
-// require a PO token.  ANDROID_VR responses may still include
-// serverAbrStreamingUrl; this ensures HAMPlayer uses client-side DASH ABR
-// instead, which skips the OnesieRequest entirely.
-//
-// renderViewType is left at the server-sent default — ANDROID_VR streams are
-// standard DASH and HAMPlayer handles them natively without AVPlayer.
+// ANDROID_VR responses may include serverAbrStreamingUrl; useServerDrivenAbr=NO
+// prevents HAMPlayer from initiating an OnesieRequest (which would require a
+// PO token) and forces client-side DASH ABR instead.
 // ---------------------------------------------------------------------------
 %hook MLPlayerPoolImpl
 
@@ -369,25 +508,12 @@ static NSURLSession *YTUHDPlayerSession(void) {
 
 %end
 
-// ---------------------------------------------------------------------------
-// SABR bypass
-//
-// Returning NO from useServerDrivenAbr causes HAMPlayer to skip the
-// OnesieRequest (initplayback) entirely, so it never presents a PO token to
-// GVS.  HAMPlayer falls back to client-side DASH ABR using the adaptiveStreams
-// list from the /player response.
-// ---------------------------------------------------------------------------
 %hook YTIMediaCommonConfig
 - (BOOL)useServerDrivenAbr { return NO; }
 %end
 
 // ---------------------------------------------------------------------------
-// WebM/AV1 format filter
-//
-// Strips WebM (VP9 video + Opus audio) and AV1-in-MP4 (itag 394-399) from
-// the adaptive streams list.  These codecs are not supported in sideloaded
-// builds and may carry additional GVS enforcement.  Belt-and-suspenders since
-// ANDROID_VR responses primarily serve H.264/AAC.
+// WebM/AV1 format filter — belt-and-suspenders
 // ---------------------------------------------------------------------------
 static NSArray *dropWebM(NSArray *formats) {
     if (!formats.count) return formats;
@@ -445,19 +571,12 @@ static NSArray *dropWebM(NSArray *formats) {
 // Network intercepts (NSURLProtocol)
 //
 // Endpoint 1: iosantiabuse-pa.googleapis.com
-//   LiveContainer2's wrong Team ID causes every AppAttest exchange to return
-//   400.  C++ caches that failure and arms a SABR kill timer on the next
-//   session.  We return a synthetic 200 + minimal proto body so C++ sees a
-//   successful exchange and never caches a failure state.
-//   Rate-limited to one synthetic 200 per 10 s to avoid C++ retry loops.
+//   Synthetic 200 + minimal proto body so C++ sees a successful AppAttest
+//   exchange and never arms the SABR kill timer.  Rate-limited to 1 per 10 s.
 //
 // Endpoint 2: youtubei.googleapis.com/youtubei/v1/att/get?t=
-//   The ?t= parameter is the CPN (Client Playback Nonce).  YouTube uses this
-//   as an attestation heartbeat; Field 27 in the response is an enforcement
-//   blob that arms a kill timer 69-73 ms after arrival.  We proxy the request
-//   to the real server (keeping the server heartbeat alive so it stays in
-//   ATTESTATION_PENDING and continues pushing media) while returning an empty
-//   200 to the client — Field 27 is never delivered, kill timer never armed.
+//   Fire-and-forget proxy: forward to server (keeps ATTESTATION_PENDING),
+//   return empty 200 to client (Field 27 enforcement blob never delivered).
 // ---------------------------------------------------------------------------
 @interface YTUHDAntiAbuseProtocol : NSURLProtocol
 @end
@@ -486,24 +605,21 @@ static NSArray *dropWebM(NSArray *formats) {
     if ([self.request.URL.host hasSuffix:@"iosantiabuse-pa.googleapis.com"]) {
         static os_unfair_lock aaLock = OS_UNFAIR_LOCK_INIT;
         static CFAbsoluteTime aaNextAllowed = 0;
-        static const CFTimeInterval kAAMinInterval = 10.0;
-
         os_unfair_lock_lock(&aaLock);
         CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
         BOOL allowed = (now >= aaNextAllowed);
-        if (allowed) aaNextAllowed = now + kAAMinInterval;
+        if (allowed) aaNextAllowed = now + 10.0;
         os_unfair_lock_unlock(&aaLock);
 
         if (allowed) {
-            static const uint8_t kAntiAbuseBody[] = { 0x0a, 0x08, 0, 0, 0, 0, 0, 0, 0, 0 };
-            NSData *body = [NSData dataWithBytes:kAntiAbuseBody length:sizeof(kAntiAbuseBody)];
+            static const uint8_t kBody[] = { 0x0a, 0x08, 0, 0, 0, 0, 0, 0, 0, 0 };
             NSHTTPURLResponse *resp = [[NSHTTPURLResponse alloc]
                 initWithURL:self.request.URL statusCode:200 HTTPVersion:@"HTTP/2.0"
                headerFields:@{@"Content-Type": @"application/x-protobuf",
                               @"Cache-Control": @"no-store"}];
             [self.client URLProtocol:self didReceiveResponse:resp
                   cacheStoragePolicy:NSURLCacheStorageNotAllowed];
-            [self.client URLProtocol:self didLoadData:body];
+            [self.client URLProtocol:self didLoadData:[NSData dataWithBytes:kBody length:sizeof(kBody)]];
             [self.client URLProtocolDidFinishLoading:self];
         } else {
             NSHTTPURLResponse *resp = [[NSHTTPURLResponse alloc]
@@ -519,14 +635,13 @@ static NSArray *dropWebM(NSArray *formats) {
         return;
     }
 
-    // att/get?t= — fire-and-forget proxy
+    // att/get?t= fire-and-forget
     static NSURLSession *sideChannel;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
         sideChannel = [NSURLSession sessionWithConfiguration:
             [NSURLSessionConfiguration defaultSessionConfiguration]];
     });
-
     NSMutableURLRequest *realReq = [self.request mutableCopy];
     [NSURLProtocol setProperty:@YES forKey:@"YTUHDHandled" inRequest:realReq];
     [[sideChannel dataTaskWithRequest:realReq
@@ -559,10 +674,6 @@ static NSArray *dropWebM(NSArray *formats) {
 
 // ---------------------------------------------------------------------------
 // PO Token bypass
-//
-// Belt-and-suspenders hooks for code paths that bypass the URL loading system.
-// The primary fix is the runtime sweep in %ctor + the anti-abuse protocol
-// above.  These hooks prevent the token manager from spinning up.
 // ---------------------------------------------------------------------------
 %hook YTHotConfig
 - (BOOL)iosClientGlobalConfigDisableIosPoTokens { return YES; }
@@ -590,27 +701,28 @@ static NSArray *dropWebM(NSArray *formats) {
 }
 %end
 
+// IGDPOTokenMinter: return the stored OAuth Bearer token as the PO token.
+// The token value isn't validated structurally by GVS for ANDROID_VR, but
+// having a non-empty token prevents the "no token available" grace timer from
+// firing if ANDROID_VR ever triggers a SABR session internally.
 %hook IGDPOTokenMinter
 - (void)mintPOTokenImmediately:(id)completionHandler {
     if (completionHandler)
-        ((void (^)(NSData *, NSError *))completionHandler)([NSData data], nil);
+        ((void (^)(NSData *, NSError *))completionHandler)(YTUHDGetOAuthTokenData(), nil);
 }
 - (void)mintPOTokenAfterUpdate:(id)update completionQueue:(id)queue completionHandler:(id)completionHandler {
     if (completionHandler)
-        ((void (^)(NSData *, NSError *))completionHandler)([NSData data], nil);
+        ((void (^)(NSData *, NSError *))completionHandler)(YTUHDGetOAuthTokenData(), nil);
 }
 - (void)mintPoTokenAfterUpdate:(id)update callOnQueue:(id)queue completionHandler:(id)completionHandler {
     if (completionHandler)
-        ((void (^)(NSData *, NSError *))completionHandler)([NSData data], nil);
+        ((void (^)(NSData *, NSError *))completionHandler)(YTUHDGetOAuthTokenData(), nil);
 }
 - (void)mintUninitializedPoToken:(id)token initializationCalled:(BOOL)initializationCalled {}
 %end
 
 // ---------------------------------------------------------------------------
 // Error logging
-//
-// Writes every player error to Documents/ytuhd_error_<ts>.txt so we can see
-// what the player framework reports without needing a debugger.
 // ---------------------------------------------------------------------------
 %hook YTMainAppVideoPlayerOverlayViewController
 - (void)handleError:(NSError *)error {
@@ -618,12 +730,11 @@ static NSArray *dropWebM(NSArray *formats) {
         @try {
             NSString *docs = NSSearchPathForDirectoriesInDomains(
                 NSDocumentDirectory, NSUserDomainMask, YES)[0];
-            NSString *msg = [NSString stringWithFormat:
-                @"ytuhd_error %@\ndomain=%@  code=%ld\n%@\n",
-                [NSDate date], error.domain, (long)error.code, error.userInfo ?: @{}];
-            [msg writeToFile:[docs stringByAppendingPathComponent:
+            [[NSString stringWithFormat:@"ytuhd_error %@\ndomain=%@  code=%ld\n%@\n",
+                [NSDate date], error.domain, (long)error.code, error.userInfo ?: @{}]
+             writeToFile:[docs stringByAppendingPathComponent:
                     [NSString stringWithFormat:@"ytuhd_error_%@.txt", ytuhd_timestamp()]]
-                  atomically:YES encoding:NSUTF8StringEncoding error:nil];
+              atomically:YES encoding:NSUTF8StringEncoding error:nil];
         } @catch (...) {}
     }
     %orig;
@@ -636,19 +747,9 @@ static NSArray *dropWebM(NSArray *formats) {
     [NSURLProtocol registerClass:[YTUHDPlayerClientProtocol class]];
     [NSURLProtocol registerClass:[YTUHDAntiAbuseProtocol class]];
 
-    // Runtime sweep: replace YTIClientInfo.clientName and related selectors
-    // on every class that implements them.
-    //
-    // Targets:
-    //   hasPoToken              → YES  (BOOL)
-    //   isIosguardAttestationEnabled → NO  (BOOL)
-    //   clientName (int, YTI*) → 28   (ANDROID_VR; IOS=5, TVHTML5=7)
-    //   clientVersion (str, YTI*) → "1.65.10"
-    //
-    // The sweep runs synchronously at dyld-init time (catches classes already
-    // registered), then twice on the main queue (catches GPBMessage subclasses
-    // registered lazily after UIApplicationMain).
-
+    // Runtime sweep (Layer 3): replace YTIClientInfo.clientName/clientVersion
+    // on all YTI-prefixed proto classes so that any internal code reading the
+    // proto directly sees ANDROID_VR (28), not IOS (5).
     SEL hasPoTokenSel        = @selector(hasPoToken);
     SEL isIosguardEnabledSel = @selector(isIosguardAttestationEnabled);
     SEL clientNameSel        = @selector(clientName);
@@ -656,12 +757,8 @@ static NSArray *dropWebM(NSArray *formats) {
 
     IMP yesIMP = imp_implementationWithBlock(^BOOL(__unused id _self) { return YES; });
     IMP noIMP  = imp_implementationWithBlock(^BOOL(__unused id _self) { return NO;  });
-
-    // ANDROID_VR = client enum 28 (confirmed from InnerTube proto; IOS=5, TVHTML5=7)
-    IMP androidVRClientNameIMP = imp_implementationWithBlock(
-        ^int32_t(__unused id _self) { return 28; });
-    IMP androidVRVersionIMP = imp_implementationWithBlock(
-        ^NSString *(__unused id _self) { return @"1.65.10"; });
+    IMP androidVRNameIMP = imp_implementationWithBlock(^int32_t(__unused id _self) { return 28; });
+    IMP androidVRVerIMP  = imp_implementationWithBlock(^NSString *(__unused id _self) { return @"1.65.10"; });
 
     void (^sweep)(void) = ^{
         unsigned int classCount = 0;
@@ -678,15 +775,12 @@ static NSArray *dropWebM(NSArray *formats) {
                 else if (sel == isIosguardEnabledSel)
                     class_replaceMethod(cls, isIosguardEnabledSel, noIMP, "B@:");
                 else if (sel == clientNameSel) {
-                    // 141 iOS system classes (Photos, AVCapture, HomeKit…) also
-                    // have clientName — filter to YTI-prefixed classes with int
-                    // return type (YouTube InnerTube proto classes only).
                     const char *ret = method_copyReturnType(methods[j]);
                     BOOL isInt = ret && (ret[0] == 'i' || ret[0] == 'I');
                     if (ret) free((void *)ret);
                     if (!isInt) continue;
                     if (![NSStringFromClass(cls) hasPrefix:@"YTI"]) continue;
-                    class_replaceMethod(cls, clientNameSel, androidVRClientNameIMP,
+                    class_replaceMethod(cls, clientNameSel, androidVRNameIMP,
                                         method_getTypeEncoding(methods[j]));
                     Method vm = class_getInstanceMethod(cls, clientVersionSel);
                     if (vm) {
@@ -694,7 +788,7 @@ static NSArray *dropWebM(NSArray *formats) {
                         BOOL vIsStr = vret && vret[0] == '@';
                         if (vret) free((void *)vret);
                         if (vIsStr)
-                            class_replaceMethod(cls, clientVersionSel, androidVRVersionIMP,
+                            class_replaceMethod(cls, clientVersionSel, androidVRVerIMP,
                                                 method_getTypeEncoding(vm));
                     }
                 }
@@ -709,7 +803,7 @@ static NSArray *dropWebM(NSArray *formats) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC),
                    dispatch_get_main_queue(), sweep);
 
-    // Diagnostic: scan at t+3s and write ytuhd_innertubeclass.txt to Documents.
+    // Diagnostic scan at t+3s — writes ytuhd_innertubeclass.txt to Documents.
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC),
                    dispatch_get_main_queue(), ^{
         NSMutableString *log = [NSMutableString stringWithFormat:
@@ -720,7 +814,6 @@ static NSArray *dropWebM(NSArray *formats) {
             @selector(clientNameValue),
         };
         const NSUInteger targetCount = sizeof(targets) / sizeof(targets[0]);
-
         unsigned int classCount = 0;
         Class *classes = objc_copyClassList(&classCount);
         for (NSUInteger t = 0; t < targetCount; t++) {
@@ -742,7 +835,6 @@ static NSArray *dropWebM(NSArray *formats) {
             [log appendString:@"\n"];
         }
         free(classes);
-
         NSString *docs = NSSearchPathForDirectoriesInDomains(
             NSDocumentDirectory, NSUserDomainMask, YES)[0];
         [log writeToFile:[docs stringByAppendingPathComponent:@"ytuhd_innertubeclass.txt"]
